@@ -36,28 +36,57 @@ const { createAnalyticsService } = require('./analytics_service');
 const { createAnalyticsAdminRouter } = require('./analytics_routes');
 const { repairDatabase, completionCollectionForStep, validationDetails } = require('./database_repair');
 const { createCommercePublicRouter, createMerchantRouter, createCommerceDriverRouter, createCommerceAdminRouter, createCommerceDispatchWorker } = require('./commerce_routes');
+const { version: PACKAGE_VERSION } = require('../package.json');
 
+const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
+const PRODUCTION = NODE_ENV === 'production';
+const APP_VERSION = String(process.env.APP_VERSION || PACKAGE_VERSION || '1.6.0').trim();
 const PORT = Number(process.env.PORT || 5050);
+const HOST = String(process.env.HOST || (PRODUCTION ? '127.0.0.1' : '0.0.0.0')).trim();
 const MONGODB_URI = String(process.env.MONGODB_URI || '').trim();
 const DB_NAME = String(process.env.MONGODB_DB || 'th79_imove').trim();
 const RETRY_MS = Math.max(3000, Number(process.env.MONGO_RETRY_SECONDS || 5) * 1000);
 const DEFAULT_BOOKING_TIMEOUT_SECONDS = Math.max(60, Number(process.env.BOOKING_SEARCH_TIMEOUT_SECONDS || 300));
-const DEMO_RUNTIME_ENABLED = String(process.env.NODE_ENV || 'development').toLowerCase() !== 'production' &&
+const DEMO_RUNTIME_ENABLED = !PRODUCTION &&
   String(process.env.SEED_DEMO_ON_START || 'false').toLowerCase() === 'true';
+const DB_REPAIR_ON_START = String(
+  process.env.DB_REPAIR_ON_START ?? (PRODUCTION ? 'false' : 'true'),
+).toLowerCase() === 'true';
+const LAN_DISCOVERY_ENABLED = String(
+  process.env.LAN_DISCOVERY_ENABLED ?? (PRODUCTION ? 'false' : 'true'),
+).toLowerCase() === 'true';
+const SERVICE_REGISTRY_ENABLED = String(
+  process.env.SERVICE_REGISTRY_ENABLED ?? (PRODUCTION ? 'false' : 'true'),
+).toLowerCase() === 'true';
 
 assertProductionConfig();
 
 const app = express();
 app.set('trust proxy', 1);
+function isLoopbackAddress(value) {
+  const address = String(value || '').replace(/^::ffff:/, '');
+  return address === '127.0.0.1' || address === '::1';
+}
+
 app.use((req, res, next) => {
-  const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
   const forceHttps = String(process.env.FORCE_HTTPS || 'false').toLowerCase() === 'true';
   const proto = String(req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http')).split(',')[0].trim();
-  if (production && forceHttps && proto !== 'https') return res.status(426).json({ code: 'HTTPS_REQUIRED', message: 'Production TH79 iMove chỉ chấp nhận HTTPS.' });
+  // Nginx/PM2 health checks hit the loopback HTTP listener directly. External traffic
+  // is still required to be HTTPS when FORCE_HTTPS=true.
+  if (PRODUCTION && forceHttps && !isLoopbackAddress(req.socket?.remoteAddress) && proto !== 'https') {
+    return res.status(426).json({ code: 'HTTPS_REQUIRED', message: 'Production TH79 iMove chỉ chấp nhận HTTPS.' });
+  }
   next();
 });
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors(buildCorsOptions()));
+app.use((error, _req, res, next) => {
+  if (error?.code !== 'CORS_ORIGIN_DENIED') return next(error);
+  return res.status(403).json({
+    code: 'CORS_ORIGIN_DENIED',
+    message: 'Origin không được phép truy cập API.',
+  });
+});
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: Math.max(60, Number(process.env.API_RATE_LIMIT_PER_MINUTE || 600)), standardHeaders: 'draft-7', legacyHeaders: false }));
 
@@ -314,31 +343,78 @@ async function expireOldBookings() {
 }
 
 app.get('/', (_req, res) => {
-  res.json({ ok: true, service: 'TH79 iMove API', version: '1.6.0', message: 'Backend đang chạy. Mở /health hoặc /api/v73/admin/health để kiểm tra production health.' });
+  res.json({
+    ok: true,
+    backend: true,
+    service: 'TH79_IMOVE_CORE',
+    name: 'TH79 iMove API',
+    version: APP_VERSION,
+    environment: NODE_ENV,
+    message: 'Backend đang chạy. Dùng /live cho liveness, /health cho MongoDB và /ready cho readiness đầy đủ.',
+  });
 });
 
+// Liveness: chỉ xác nhận process Node/Express còn sống. Không phụ thuộc MongoDB/Redis/FCM.
+app.get('/live', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    backend: true,
+    service: 'TH79_IMOVE_CORE',
+    version: APP_VERSION,
+    environment: NODE_ENV,
+    uptimeSeconds: Math.round(process.uptime()),
+    generatedAt: new Date(),
+  });
+});
+
+// Health: endpoint ổn định cho Admin Gateway/Nginx. HTTP 200 khi MongoDB sẵn sàng.
 app.get('/health', async (_req, res) => {
   try {
     const health = await productionService.systemHealth();
     mongoConnected = Boolean(health?.components?.mongodb?.ok);
-    return res.status(mongoConnected ? 200 : 503).json({
+    const payload = {
       ...health,
+      ok: mongoConnected,
+      ready: Boolean(health?.ok),
       backend: true,
+      service: 'TH79_IMOVE_CORE',
+      name: 'TH79 iMove API',
+      version: APP_VERSION,
       database: mongoConnected,
       databaseName: DB_NAME,
-      mongoUri: maskedMongoUri(),
+      mongoConfigured: Boolean(MONGODB_URI),
       lastMongoError,
-    });
+    };
+    if (!PRODUCTION) payload.mongoUri = maskedMongoUri();
+    return res.status(mongoConnected ? 200 : 503).json(payload);
   } catch (error) {
-    return res.status(503).json({ ok: false, backend: true, service: 'TH79_IMOVE_CORE', version: '1.6.0', message: error.message });
+    return res.status(503).json({
+      ok: false,
+      ready: false,
+      backend: true,
+      service: 'TH79_IMOVE_CORE',
+      name: 'TH79 iMove API',
+      version: APP_VERSION,
+      message: error.message,
+    });
   }
 });
 
+// Readiness: dùng cho kiểm tra toàn bộ dependency được cấu hình là bắt buộc.
 app.get('/ready', async (_req, res) => {
   try {
     const health = await productionService.systemHealth();
-    return res.status(health.ok ? 200 : 503).json({ ok: health.ok, version: health.version, components: health.components, generatedAt: health.generatedAt });
-  } catch (error) { return res.status(503).json({ ok: false, message: error.message }); }
+    return res.status(health.ok ? 200 : 503).json({
+      ok: health.ok,
+      backend: true,
+      service: 'TH79_IMOVE_CORE',
+      version: APP_VERSION,
+      components: health.components,
+      generatedAt: health.generatedAt,
+    });
+  } catch (error) {
+    return res.status(503).json({ ok: false, backend: true, service: 'TH79_IMOVE_CORE', version: APP_VERSION, message: error.message });
+  }
 });
 
 
@@ -1296,8 +1372,12 @@ async function connectMongo() {
     const pong = await nextDb.command({ ping: 1 });
     if (pong.ok !== 1) throw new Error('MongoDB ping thất bại');
     db = nextDb;
-    console.log('[DB REPAIR] Kiểm tra dữ liệu legacy + validator trước khi mở Backend...');
-    await repairDatabase({ db: nextDb, client: mongoClient, logger: console });
+    if (DB_REPAIR_ON_START) {
+      console.log('[DB REPAIR] Kiểm tra dữ liệu legacy + validator trước khi mở Backend...');
+      await repairDatabase({ db: nextDb, client: mongoClient, logger: console });
+    } else {
+      console.log('[DB REPAIR] Bỏ qua auto-repair khi startup (DB_REPAIR_ON_START=false).');
+    }
     mongoConnected = true;
     lastMongoError = null;
     if (String(process.env.NODE_ENV || 'development').toLowerCase() !== 'production' &&
@@ -1326,35 +1406,50 @@ async function connectMongo() {
 let discoveryService = null;
 let registryService = null;
 
-const server = app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, HOST, () => {
   console.log('======================================================');
-  console.log(' TH79 iMove Backend v7.3 - Production Ready');
+  console.log(` TH79 iMove Core Backend ${APP_VERSION}`);
   console.log('======================================================');
-  console.log(`PC health        : http://127.0.0.1:${PORT}/health`);
-  console.log(`Web User/Driver  : http://127.0.0.1:${PORT}`);
-  console.log(`Android emulator : http://10.0.2.2:${PORT}`);
+  console.log(`Environment      : ${NODE_ENV}`);
+  console.log(`Listen           : http://${HOST}:${PORT}`);
+  console.log(`Liveness         : http://127.0.0.1:${PORT}/live`);
+  console.log(`Health           : http://127.0.0.1:${PORT}/health`);
+  console.log(`Readiness        : http://127.0.0.1:${PORT}/ready`);
+  console.log(`Public URL       : ${String(process.env.CORE_PUBLIC_URL || '(chưa cấu hình)').trim()}`);
   console.log(`Database         : ${DB_NAME}`);
-  console.log(`Atlas URI        : ${maskedMongoUri()}`);
+  console.log(`Mongo configured : ${MONGODB_URI ? 'YES' : 'NO'}`);
+
   const discoveryPort = Number(process.env.LAN_DISCOVERY_PORT || 5051);
-  discoveryService = startLanDiscovery({
-    httpPort: PORT,
-    discoveryPort,
-  });
-  registryService = startServiceRegistry({
-    getDb: () => db,
-    httpPort: PORT,
-    discoveryPort,
-  });
-  const lanAddresses = getLanAddresses();
-  if (lanAddresses.length) {
-    for (const item of lanAddresses) {
-      console.log(`LAN Backend      : http://${item.address}:${PORT}`);
-    }
+  if (LAN_DISCOVERY_ENABLED) {
+    discoveryService = startLanDiscovery({ httpPort: PORT, discoveryPort });
+    const lanAddresses = getLanAddresses();
+    for (const item of lanAddresses) console.log(`LAN Backend      : http://${item.address}:${PORT}`);
   } else {
-    console.log('LAN Backend      : Không tìm thấy IPv4 LAN');
+    console.log('LAN Discovery    : DISABLED');
   }
-  console.log(`Auto Discovery   : UDP ${discoveryPort} + Atlas service_registry`);
+
+  if (SERVICE_REGISTRY_ENABLED) {
+    registryService = startServiceRegistry({
+      getDb: () => db,
+      httpPort: PORT,
+      discoveryPort,
+    });
+    console.log('Service Registry : ENABLED');
+  } else {
+    console.log('Service Registry : DISABLED');
+  }
   console.log('======================================================');
+});
+
+server.keepAliveTimeout = Math.max(65000, Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 65000));
+server.headersTimeout = Math.max(server.keepAliveTimeout + 1000, Number(process.env.HEADERS_TIMEOUT_MS || 66000));
+server.requestTimeout = Math.max(30000, Number(process.env.REQUEST_TIMEOUT_MS || 120000));
+server.on('error', (error) => {
+  if (error?.code === 'EADDRINUSE') {
+    console.error(`[HTTP] Port ${PORT} đang được sử dụng. Kiểm tra PM2/process cũ trước khi chạy lại.`);
+  } else {
+    console.error('[HTTP] Server error:', error);
+  }
 });
 
 matching = createMatchingEngine({
@@ -1386,7 +1481,11 @@ commerceDispatchWorker.start();
 
 connectMongo();
 
-async function shutdown() {
+let shuttingDown = false;
+async function shutdown(signal = 'SIGTERM', exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[Shutdown] ${signal} - đang đóng dịch vụ...`);
   clearTimeout(retryTimer);
   try { discoveryService?.close(); } catch (_) {}
   try { registryService?.close(); } catch (_) {}
@@ -1396,9 +1495,26 @@ async function shutdown() {
   try { matching?.close(); } catch (_) {}
   try { await productionService?.close(); } catch (_) {}
   try { if (mongoClient) await mongoClient.close(); } catch (_) {}
-  server.close(() => process.exit(0));
+
+  const forceTimer = setTimeout(() => {
+    try { server.closeAllConnections?.(); } catch (_) {}
+    process.exit(exitCode || 1);
+  }, 10000);
+  forceTimer.unref?.();
+
+  server.close(() => {
+    clearTimeout(forceTimer);
+    process.exit(exitCode);
+  });
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => shutdown('SIGINT', 0));
+process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+process.on('unhandledRejection', (error) => {
+  console.error('[Process] Unhandled rejection:', error);
+});
+process.on('uncaughtException', (error) => {
+  console.error('[Process] Uncaught exception:', error);
+  shutdown('uncaughtException', 1).catch(() => process.exit(1));
+});
 
 
