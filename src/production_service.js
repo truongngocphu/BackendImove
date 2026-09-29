@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const { version: PACKAGE_VERSION } = require('../package.json');
+const APP_VERSION = String(process.env.APP_VERSION || PACKAGE_VERSION || '1.6.0').trim();
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -195,7 +197,7 @@ function createProductionService({ getDb, getMongoConnected, getNotifications, g
       updateRequired,
       minimumVersion: min,
       latestVersion: latest,
-      serverVersion: '1.6.0',
+      serverVersion: APP_VERSION,
       securityMode: config.securityMode,
       securityPolicy: config.securityPolicy,
     };
@@ -291,12 +293,14 @@ function createProductionService({ getDb, getMongoConnected, getNotifications, g
     const avgLatency = metrics.requests ? metrics.totalLatencyMs / metrics.requests : 0;
     const errorRate = metrics.requests ? (metrics.errors / metrics.requests) * 100 : 0;
     const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
-    const redisRequired = boolEnv('REDIS_REQUIRED', production);
+    const redisRequired = boolEnv('REDIS_REQUIRED', false);
+    const fcmRequired = boolEnv('FCM_REQUIRED', false);
+    const fcmConfigured = Boolean(getNotifications?.()?.isConfigured?.());
     const components = {
       api: { status: 'ONLINE', ok: true },
       mongodb: { status: mongo ? 'ONLINE' : 'OFFLINE', ok: mongo, latencyMs: mongoLatencyMs },
       redis: { status: redis ? 'ONLINE' : redisStatus, ok: redis || !redisRequired, required: redisRequired, error: redisError },
-      fcm: { status: getNotifications?.()?.isConfigured?.() ? 'ONLINE' : 'NOT_CONFIGURED', ok: Boolean(getNotifications?.()?.isConfigured?.()) },
+      fcm: { status: fcmConfigured ? 'ONLINE' : 'NOT_CONFIGURED', ok: fcmConfigured || !fcmRequired, required: fcmRequired },
       matching: { status: getMatching?.() ? 'ONLINE' : 'OFFLINE', ok: Boolean(getMatching?.()) },
       dispatch: { status: getDispatch?.() ? 'ONLINE' : 'OFFLINE', ok: Boolean(getDispatch?.()) },
       socket: { status: 'ONLINE', ok: true, connections: sockets },
@@ -304,7 +308,7 @@ function createProductionService({ getDb, getMongoConnected, getNotifications, g
     return {
       ok: Object.values(components).every((x) => x.ok),
       service: 'TH79_IMOVE_CORE',
-      version: '1.4.0',
+      version: APP_VERSION,
       environment: process.env.NODE_ENV || 'development',
       uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
       components,

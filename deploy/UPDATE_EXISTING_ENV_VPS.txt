@@ -1,0 +1,30 @@
+TH79 iMove Backend - các dòng cần chỉnh trong .env hiện có khi đưa lên VPS
+
+GIỮ NGUYÊN các secret thật của bạn (MONGODB_URI, JWT_ACCESS_SECRET, KYC_DATA_KEY, FACE_EVIDENCE_KEY...), nhưng đổi/ thêm các dòng không-secret sau:
+
+NODE_ENV=production
+HOST=127.0.0.1
+PORT=5050
+APP_VERSION=1.6.0
+DB_REPAIR_ON_START=false
+
+CORE_PUBLIC_URL=https://backendimove.daututh79.com
+LAN_DISCOVERY_ENABLED=false
+SERVICE_REGISTRY_ENABLED=false
+
+CORS_ORIGINS=https://imove.daututh79.com
+FORCE_HTTPS=true
+TLS_TERMINATED_BY_PROXY=true
+
+REDIS_REQUIRED=false
+FCM_REQUIRED=false
+FACE_PROVIDER_MODE=MANUAL
+SEED_DEMO_ON_START=false
+MATCHING_ALLOW_NO_GPS_FALLBACK=false
+TRUST_MATCHING_ENFORCEMENT=true
+
+LƯU Ý:
+- Không để CORE_PUBLIC_URL=http://127.0.0.1:5050 trên VPS.
+- Không dùng CORS_ORIGINS=https//... (thiếu dấu :).
+- Không dùng FACE_PROVIDER_MODE=DEV khi NODE_ENV=production.
+- Nếu bật REDIS_REQUIRED=true thì bắt buộc phải có REDIS_URL hợp lệ.
