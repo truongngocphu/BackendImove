@@ -75,7 +75,11 @@ function buildCorsOptions() {
     origin(origin, callback) {
       // Native apps và server-to-server thường không có Origin header.
       if (!origin || allowed.has(origin)) return callback(null, true);
-      return callback(new Error('CORS origin không được phép.'));
+      const error = new Error('CORS origin không được phép.');
+      error.code = 'CORS_ORIGIN_DENIED';
+      error.origin = origin;
+      console.warn(`[CORS] Origin bị chặn: ${JSON.stringify(origin)}`);
+      return callback(error);
     },
   };
 }

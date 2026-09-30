@@ -81,6 +81,13 @@ app.use((req, res, next) => {
 });
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors(buildCorsOptions()));
+app.use((error, _req, res, next) => {
+  if (error?.code !== 'CORS_ORIGIN_DENIED') return next(error);
+  return res.status(403).json({
+    code: 'CORS_ORIGIN_DENIED',
+    message: 'Origin không được phép truy cập API.',
+  });
+});
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: Math.max(60, Number(process.env.API_RATE_LIMIT_PER_MINUTE || 600)), standardHeaders: 'draft-7', legacyHeaders: false }));
 
