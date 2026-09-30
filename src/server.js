@@ -36,6 +36,7 @@ const { createAnalyticsService } = require('./analytics_service');
 const { createAnalyticsAdminRouter } = require('./analytics_routes');
 const { repairDatabase, completionCollectionForStep, validationDetails } = require('./database_repair');
 const { createCommercePublicRouter, createMerchantRouter, createCommerceDriverRouter, createCommerceAdminRouter, createCommerceDispatchWorker } = require('./commerce_routes');
+const { createAdminConsoleRouter } = require('./admin_console_routes');
 const { version: PACKAGE_VERSION } = require('../package.json');
 
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
@@ -1340,6 +1341,18 @@ app.get('/api/customers/:phone/bookings', requireCustomer, async (req, res) => {
   }
 });
 
+
+// Admin Console API is merged directly into the Core Backend.
+// This removes the separate Admin Gateway :5060 and lets the Vercel Admin call
+// https://backendimove.daututh79.com/api/... directly without any Nginx changes.
+const adminConsoleRouter = createAdminConsoleRouter({
+  getDb: () => db,
+  appVersion: APP_VERSION,
+  backendUrl: String(process.env.CORE_PUBLIC_URL || 'https://backendimove.daututh79.com'),
+});
+app.use(adminConsoleRouter);
+
+
 async function connectMongo() {
   if (connecting || mongoConnected) return;
   connecting = true;
@@ -1371,6 +1384,8 @@ async function connectMongo() {
     } else {
       console.log('[DB REPAIR] Bỏ qua auto-repair khi startup (DB_REPAIR_ON_START=false).');
     }
+    await adminConsoleRouter.ensureAdminRbacSeed();
+    console.log('[Admin Console] RBAC routes + indexes READY (merged into Core).');
     mongoConnected = true;
     lastMongoError = null;
     if (String(process.env.NODE_ENV || 'development').toLowerCase() !== 'production' &&

@@ -95,6 +95,22 @@ FACE_PROVIDER_MODE=MANUAL
 
 Nếu sau này Redis/FCM đã cấu hình thật, đổi `*_REQUIRED=true` tương ứng.
 
-## 6. Lưu ý Admin Vercel
+## 6. Admin Vercel - không còn Gateway 5060
 
-Backend Core chạy đúng không đồng nghĩa Vercel có Admin Gateway. Frontend `https://imove.daututh79.com` vẫn cần `/api/*` và `/core-api/*` được rewrite tới Admin Gateway riêng (port 5060/domain Admin API). Đây là tầng khác với Core Backend.
+Bản này đã gộp các API quản trị cần thiết vào Core Backend. Không cần chạy Admin Gateway port 5060, không cần thêm Nginx `/admin-gateway`, và không cần rewrite API trên Vercel.
+
+Admin frontend gọi trực tiếp:
+
+```text
+https://backendimove.daututh79.com
+```
+
+Kiểm tra sau deploy:
+
+```bash
+curl -i https://backendimove.daututh79.com/api/health
+```
+
+Kết quả đúng có `service: TH79_IMOVE_CORE_ADMIN` và `mergedIntoCore: true`.
+
+Các route quản trị đã gộp gồm `/api/bootstrap`, `/api/data/*`, `/api/admin-access/*`, `/api/admin-management/*`, `/api/admin-profile`, `/api/admin-audit` và các route pricing legacy mà Admin hiện tại đang dùng. Các route dữ liệu nhạy cảm yêu cầu Bearer token ADMIN.
