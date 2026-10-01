@@ -145,7 +145,7 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       readAt: null,
       createdAt: iso(now),
     };
-    try { getMatching()?.emitToUser?.(userId, 'notification:new', payload); } catch (_) {}
+    try { getMatching()?.emitToUser?.(userId, 'notification:new', payload); } catch (_) { }
     return payload;
   }
 
@@ -180,7 +180,7 @@ function createPlatformService({ getDb, getClient, getMatching }) {
     const otherIds = participantIds.filter((id) => String(id) !== String(viewerId));
     const others = otherIds.length
       ? await db.collection('users').find({ _id: { $in: otherIds } })
-          .project({ fullName: 1, phone: 1, roles: 1 }).toArray()
+        .project({ fullName: 1, phone: 1, roles: 1 }).toArray()
       : [];
 
     const readAt = doc.readState?.[String(viewerId)] || null;
@@ -466,7 +466,19 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       ),
       db.collection('conversations').createIndex({ participantUserIds: 1, updatedAt: -1 }, { name: 'idx_conversation_participant' }),
       db.collection('messages').createIndex({ conversationId: 1, createdAt: 1 }, { name: 'idx_messages_conversation' }),
-      db.collection('messages').createIndex({ conversationId: 1, idempotencyKey: 1 }, { unique: true, sparse: true, name: 'uq_message_idempotency' }),
+      db.collection('messages').createIndex(
+        { conversationId: 1, idempotencyKey: 1 },
+        {
+          unique: true,
+          partialFilterExpression: {
+            idempotencyKey: {
+              $exists: true,
+              $type: 'string'
+            }
+          },
+          name: 'uq_message_idempotency'
+        }
+      ),
       db.collection('safety_shares').createIndex({ tokenHash: 1 }, { unique: true, name: 'uq_safety_share_token' }),
       db.collection('safety_shares').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'ttl_safety_share' }),
     ]);
@@ -909,7 +921,7 @@ function createPlatformService({ getDb, getClient, getMatching }) {
           },
         },
       );
-      getMatching()?.dispatchBooking?.(ctx.booking._id, { force: true }).catch(() => {});
+      getMatching()?.dispatchBooking?.(ctx.booking._id, { force: true }).catch(() => { });
       const updated = await db.collection('bookings').findOne({ _id: ctx.booking._id });
       getMatching()?.emitBookingUpdate?.(updated);
       return res.json(getMatching()?.serializeBookingPublic?.(updated) || { id: String(updated._id), status: updated.status });
@@ -1590,9 +1602,9 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       Array.isArray(conversation.participantUserIds) &&
       conversation.participantUserIds.some((x) => String(x) === String(user._id))
     ) || (
-      conversation.type === 'SUPPORT' &&
-      String(conversation.ownerUserId) === String(user._id)
-    );
+        conversation.type === 'SUPPORT' &&
+        String(conversation.ownerUserId) === String(user._id)
+      );
     return allowed ? conversation : null;
   }
 
@@ -1657,7 +1669,7 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       );
       if (conversation.ownerUserId) targets.add(String(conversation.ownerUserId));
       for (const id of targets) {
-        try { getMatching()?.emitToUser?.(id, 'chat:new_message', payload); } catch (_) {}
+        try { getMatching()?.emitToUser?.(id, 'chat:new_message', payload); } catch (_) { }
       }
       return res.status(201).json(payload);
     } catch (error) {
