@@ -18,6 +18,36 @@ const DOC_SIDES = {
   CRIMINAL_RECORD: new Set(['document']),
 };
 
+
+const VEHICLE_SERVICE_RULES = Object.freeze({
+  MOTORBIKE: ['BIKE', 'FOOD', 'ERRAND', 'DELIVERY'],
+  CAR_4: ['CAR_4'],
+  CAR_7: ['CAR_7'],
+  MPV_7: ['MPV_7'],
+  LUXURY_4: ['LUXURY_4'],
+  LUXURY_7: ['LUXURY_7'],
+});
+
+function normalizeVehicleType(value) {
+  const code = String(value || 'MOTORBIKE').trim().toUpperCase();
+  return Object.prototype.hasOwnProperty.call(VEHICLE_SERVICE_RULES, code) ? code : 'MOTORBIKE';
+}
+
+function normalizeVehicleServices(vehicleType, raw, fallback = []) {
+  const allowed = VEHICLE_SERVICE_RULES[vehicleType] || VEHICLE_SERVICE_RULES.MOTORBIKE;
+  const source = Array.isArray(raw) && raw.length ? raw : fallback;
+  const selected = [...new Set((Array.isArray(source) ? source : [])
+    .map((value) => String(value || '').trim().toUpperCase())
+    .filter((code) => SERVICE_CODES.includes(code) && allowed.includes(code)))];
+  if (selected.length) return selected;
+  return vehicleType === 'MOTORBIKE' ? ['BIKE'] : [allowed[0]];
+}
+
+function normalizeServicePreferences(codes, raw = {}) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return Object.fromEntries(codes.map((code) => [code, source[code] !== false]));
+}
+
 const now = () => new Date();
 const projectRoot = path.resolve(__dirname, '..');
 const uploadRoot = path.resolve(projectRoot, String(process.env.KYC_UPLOAD_DIR || 'storage/kyc'));
@@ -185,8 +215,14 @@ function publicVehicle(vehicle) {
   if (!vehicle) return null;
   return {
     id: String(vehicle._id),
+    vehicleType: vehicle.vehicleType || 'MOTORBIKE',
     serviceCode: vehicle.serviceCode || 'BIKE',
     serviceCodes: Array.isArray(vehicle.serviceCodes) && vehicle.serviceCodes.length ? vehicle.serviceCodes : [vehicle.serviceCode || 'BIKE'],
+    requestedServiceCodes: Array.isArray(vehicle.requestedServiceCodes) && vehicle.requestedServiceCodes.length
+      ? vehicle.requestedServiceCodes
+      : (Array.isArray(vehicle.serviceCodes) && vehicle.serviceCodes.length ? vehicle.serviceCodes : [vehicle.serviceCode || 'BIKE']),
+    approvedServiceCodes: Array.isArray(vehicle.approvedServiceCodes) ? vehicle.approvedServiceCodes : [],
+    servicePreferences: vehicle.servicePreferences && typeof vehicle.servicePreferences === 'object' ? vehicle.servicePreferences : {},
     plateNumber: vehicle.plateNumber || null,
     brand: vehicle.brand || null,
     model: vehicle.model || null,
@@ -400,22 +436,38 @@ function createKycRouter({ getDb }) {
       const driver = await ensureDriver(db, req.auth.userId);
       const body = req.body || {};
       const existing = await db.collection('vehicles').findOne({ driverId: driver._id }, { sort: { updatedAt: -1 } });
-      const requestedCodes = Array.isArray(body.serviceCodes)
-        ? body.serviceCodes.map((x) => String(x).trim().toUpperCase()).filter((x) => SERVICE_CODES.includes(x))
-        : [];
-      const fallbackCode = String(body.serviceCode || existing?.serviceCode || existing?.serviceCodes?.[0] || 'BIKE').toUpperCase();
-      const serviceCodes = [...new Set(requestedCodes.length ? requestedCodes : [fallbackCode])].filter((x) => SERVICE_CODES.includes(x));
-      if (!serviceCodes.length) return res.status(400).json({ message: 'Vui lòng chọn ít nhất một danh mục dịch vụ hợp lệ.' });
+      const vehicleType = normalizeVehicleType(
+        body.vehicleType || existing?.vehicleType || driver.vehicleType || driver.requestedVehicleType || 'MOTORBIKE',
+      );
+      const rawRequested = Array.isArray(body.requestedServiceCodes)
+        ? body.requestedServiceCodes
+        : (Array.isArray(body.serviceCodes) ? body.serviceCodes : []);
+      const fallbackCodes = Array.isArray(existing?.requestedServiceCodes) && existing.requestedServiceCodes.length
+        ? existing.requestedServiceCodes
+        : (Array.isArray(existing?.serviceCodes) ? existing.serviceCodes : [existing?.serviceCode || 'BIKE']);
+      const requestedServiceCodes = normalizeVehicleServices(vehicleType, rawRequested, fallbackCodes);
+      const servicePreferences = normalizeServicePreferences(
+        requestedServiceCodes,
+        body.servicePreferences || existing?.servicePreferences || driver.servicePreferences || {},
+      );
+      const vehicleChanged = Boolean(existing) && (
+        String(existing.vehicleType || 'MOTORBIKE') !== vehicleType
+        || String(existing.plateNumber || '').trim() !== String(body.plateNumber || existing?.plateNumber || '').trim()
+      );
       const patch = {
-        serviceCode: serviceCodes[0],
-        serviceCodes,
+        vehicleType,
+        serviceCode: requestedServiceCodes[0],
+        serviceCodes: requestedServiceCodes,
+        requestedServiceCodes,
+        approvedServiceCodes: vehicleChanged ? [] : (Array.isArray(existing?.approvedServiceCodes) ? existing.approvedServiceCodes : []),
+        servicePreferences,
         plateNumber: String(body.plateNumber || existing?.plateNumber || '').trim(),
         brand: String(body.brand || existing?.brand || '').trim() || null,
         model: String(body.model || existing?.model || '').trim() || null,
         color: String(body.color || existing?.color || '').trim() || null,
         year: body.year !== undefined ? Number(body.year) || null : existing?.year || null,
         photos: existing?.photos || { front: null, left: null, right: null, rear: null },
-        verificationStatus: existing?.verificationStatus === 'APPROVED' ? 'APPROVED' : 'UPLOADED',
+        verificationStatus: vehicleChanged ? 'UPLOADED' : (existing?.verificationStatus === 'APPROVED' ? 'APPROVED' : 'UPLOADED'),
         rejectionReason: null,
         updatedAt: now(),
       };
@@ -425,6 +477,18 @@ function createKycRouter({ getDb }) {
       } else {
         await db.collection('vehicles').insertOne({ driverId: driver._id, status: 'PENDING', ...patch, createdAt: now() });
       }
+      await db.collection('drivers').updateOne(
+        { _id: driver._id },
+        {
+          $set: {
+            requestedVehicleType: vehicleType,
+            vehicleType,
+            requestedServiceCodes,
+            servicePreferences,
+            updatedAt: now(),
+          },
+        },
+      );
       const vehicle = await db.collection('vehicles').findOne({ driverId: driver._id }, { sort: { updatedAt: -1 } });
       return res.json(publicVehicle(vehicle));
     } catch (error) {
@@ -664,7 +728,35 @@ function createKycRouter({ getDb }) {
           updatedAt: changedAt,
         } });
         await db.collection('driver_documents').updateMany({ driverId }, { $set: { status: 'APPROVED', rejectionReason: null, verifiedBy: req.auth.userId, verifiedAt: changedAt, updatedAt: changedAt } });
-        await db.collection('vehicles').updateMany({ driverId }, { $set: { status: 'APPROVED', verificationStatus: 'APPROVED', rejectionReason: null, verifiedAt: changedAt, updatedAt: changedAt } });
+        const approvedVehicle = await db.collection('vehicles').findOne({ driverId }, { sort: { updatedAt: -1 } });
+        const approvedVehicleType = normalizeVehicleType(approvedVehicle?.vehicleType || driver.vehicleType || driver.requestedVehicleType || 'MOTORBIKE');
+        const approvedServiceCodes = normalizeVehicleServices(
+          approvedVehicleType,
+          approvedVehicle?.requestedServiceCodes || approvedVehicle?.serviceCodes,
+          ['BIKE'],
+        );
+        const approvedPreferences = normalizeServicePreferences(
+          approvedServiceCodes,
+          approvedVehicle?.servicePreferences || driver.servicePreferences || {},
+        );
+        await db.collection('vehicles').updateMany({ driverId }, { $set: {
+          status: 'APPROVED',
+          verificationStatus: 'APPROVED',
+          vehicleType: approvedVehicleType,
+          approvedServiceCodes,
+          servicePreferences: approvedPreferences,
+          rejectionReason: null,
+          verifiedAt: changedAt,
+          updatedAt: changedAt,
+        } });
+        await db.collection('drivers').updateOne({ _id: driverId }, { $set: {
+          vehicleType: approvedVehicleType,
+          requestedVehicleType: approvedVehicleType,
+          requestedServiceCodes: approvedServiceCodes,
+          approvedServiceCodes,
+          servicePreferences: approvedPreferences,
+          updatedAt: changedAt,
+        } });
         await db.collection('driver_bank_accounts').updateMany({ driverId }, { $set: { verificationStatus: 'APPROVED', rejectionReason: null, verifiedAt: changedAt, updatedAt: changedAt } });
       } else {
         await db.collection('drivers').updateOne({ _id: driverId }, { $set: { approvalStatus: 'PENDING', kycStatus: 'REJECTED', kycRejectionReason: reason, kycReviewedAt: changedAt, kycReviewedBy: req.auth.userId, onlineStatus: 'OFFLINE', updatedAt: changedAt } });
@@ -682,6 +774,41 @@ function createKycRouter({ getDb }) {
       return res.json({ ok: true, decision, kycStatus: decision === 'APPROVE' ? 'APPROVED' : 'REJECTED' });
     } catch (error) {
       return res.status(500).json({ message: error.message });
+    }
+  });
+
+
+  router.post('/admin/drivers/:driverId/services', requireRole('ADMIN'), async (req, res) => {
+    try {
+      const driverId = safeObjectId(req.params.driverId);
+      if (!driverId) return res.status(400).json({ message: 'Driver id không hợp lệ.' });
+      const db = getDb();
+      const driver = await db.collection('drivers').findOne({ _id: driverId });
+      if (!driver) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
+      const vehicle = await db.collection('vehicles').findOne({ driverId }, { sort: { updatedAt: -1 } });
+      if (!vehicle) return res.status(404).json({ message: 'Tài xế chưa có phương tiện.' });
+      const vehicleType = normalizeVehicleType(vehicle.vehicleType || driver.vehicleType || 'MOTORBIKE');
+      const approvedServiceCodes = normalizeVehicleServices(vehicleType, req.body?.approvedServiceCodes, []);
+      const servicePreferences = normalizeServicePreferences(
+        approvedServiceCodes,
+        req.body?.servicePreferences || vehicle.servicePreferences || driver.servicePreferences || {},
+      );
+      const changedAt = now();
+      await Promise.all([
+        db.collection('vehicles').updateOne({ _id: vehicle._id }, { $set: { approvedServiceCodes, servicePreferences, updatedAt: changedAt } }),
+        db.collection('drivers').updateOne({ _id: driverId }, { $set: { approvedServiceCodes, servicePreferences, updatedAt: changedAt } }),
+        db.collection('verification_logs').insertOne({
+          driverId,
+          action: 'DRIVER_SERVICES_UPDATED',
+          actorUserId: req.auth.userId,
+          approvedServiceCodes,
+          servicePreferences,
+          createdAt: changedAt,
+        }),
+      ]);
+      return res.json({ ok: true, vehicleType, approvedServiceCodes, servicePreferences });
+    } catch (error) {
+      return res.status(400).json({ message: error.message });
     }
   });
 

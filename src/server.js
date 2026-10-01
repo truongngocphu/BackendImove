@@ -37,6 +37,7 @@ const { createAnalyticsAdminRouter } = require('./analytics_routes');
 const { repairDatabase, completionCollectionForStep, validationDetails } = require('./database_repair');
 const { createCommercePublicRouter, createMerchantRouter, createCommerceDriverRouter, createCommerceAdminRouter, createCommerceDispatchWorker } = require('./commerce_routes');
 const { createAdminConsoleRouter } = require('./admin_console_routes');
+const { createFundTopupRouter, createFundTopupAdminRouter } = require('./fund_topup_routes');
 const { version: PACKAGE_VERSION } = require('../package.json');
 
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
@@ -81,13 +82,6 @@ app.use((req, res, next) => {
 });
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors(buildCorsOptions()));
-app.use((error, _req, res, next) => {
-  if (error?.code !== 'CORS_ORIGIN_DENIED') return next(error);
-  return res.status(403).json({
-    code: 'CORS_ORIGIN_DENIED',
-    message: 'Origin không được phép truy cập API.',
-  });
-});
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: Math.max(60, Number(process.env.API_RATE_LIMIT_PER_MINUTE || 600)), standardHeaders: 'draft-7', legacyHeaders: false }));
 
@@ -451,6 +445,8 @@ app.use('/api', async (req, res, next) => {
 });
 
 app.use('/api/auth', createAuthRouter({ getDb: () => db }));
+app.use('/api/v171/funds', createFundTopupRouter({ getDb:()=>db }));
+app.use('/api/v171/admin/funds', createFundTopupAdminRouter({ getDb:()=>db }));
 
 const {
   requireCustomer,

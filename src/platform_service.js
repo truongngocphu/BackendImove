@@ -466,6 +466,7 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       ),
       db.collection('conversations').createIndex({ participantUserIds: 1, updatedAt: -1 }, { name: 'idx_conversation_participant' }),
       db.collection('messages').createIndex({ conversationId: 1, createdAt: 1 }, { name: 'idx_messages_conversation' }),
+      db.collection('messages').createIndex({ conversationId: 1, idempotencyKey: 1 }, { unique: true, sparse: true, name: 'uq_message_idempotency' }),
       db.collection('safety_shares').createIndex({ tokenHash: 1 }, { unique: true, name: 'uq_safety_share_token' }),
       db.collection('safety_shares').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'ttl_safety_share' }),
     ]);
@@ -1616,13 +1617,25 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       if (!conversation) return res.status(403).json({ message: 'Bạn không có quyền nhắn trong cuộc trò chuyện này.' });
       const text = cleanText(req.body?.text, config.messageMaxLength);
       if (!text) return res.status(400).json({ message: 'Tin nhắn không được để trống.' });
+      const idempotencyKey = cleanText(
+        req.headers['idempotency-key'] || req.body?.idempotencyKey,
+        160,
+      );
+      if (idempotencyKey) {
+        const existing = await db.collection('messages').findOne({
+          conversationId: conversation._id,
+          idempotencyKey,
+        });
+        if (existing) return res.json(serializeMessage(existing));
+      }
 
       const doc = {
         conversationId: conversation._id,
         senderUserId: user._id,
-        senderRole: hasRole(user, 'DRIVER') ? 'DRIVER' : 'CUSTOMER',
+        senderRole: hasRole(user, 'DRIVER') ? 'DRIVER' : (hasRole(user, 'MERCHANT') ? 'MERCHANT' : 'CUSTOMER'),
         type: 'TEXT',
         text,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
         createdAt: new Date(),
       };
       const result = await db.collection('messages').insertOne(doc);
@@ -1648,6 +1661,9 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       }
       return res.status(201).json(payload);
     } catch (error) {
+      if (error?.code === 11000) {
+        return res.status(409).json({ code: 'MESSAGE_DUPLICATE', message: 'Tin nhắn đã được ghi nhận.' });
+      }
       return res.status(500).json({ message: error.message });
     }
   });

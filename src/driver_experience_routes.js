@@ -199,6 +199,67 @@ function createDriverExperienceRouter({ getDb, findDriverByPhone }) {
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 
+
+
+  router.get('/services', async (req, res) => {
+    try {
+      const db = getDb();
+      const ctx = await findDriverContext(db, req, findDriverByPhone);
+      if (!ctx) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
+      const vehicle = await db.collection('vehicles').findOne({ driverId: ctx.driver._id }, { sort: { updatedAt: -1 } });
+      const requestedServiceCodes = Array.isArray(vehicle?.requestedServiceCodes) && vehicle.requestedServiceCodes.length
+        ? vehicle.requestedServiceCodes
+        : (Array.isArray(ctx.driver.requestedServiceCodes) ? ctx.driver.requestedServiceCodes : []);
+      const approvedServiceCodes = Array.isArray(vehicle?.approvedServiceCodes) && vehicle.approvedServiceCodes.length
+        ? vehicle.approvedServiceCodes
+        : (Array.isArray(ctx.driver.approvedServiceCodes) && ctx.driver.approvedServiceCodes.length
+          ? ctx.driver.approvedServiceCodes
+          : (vehicle?.status === 'APPROVED' && Array.isArray(vehicle?.serviceCodes) ? vehicle.serviceCodes : []));
+      const rawPreferences = {
+        ...(ctx.driver.servicePreferences && typeof ctx.driver.servicePreferences === 'object' ? ctx.driver.servicePreferences : {}),
+        ...(vehicle?.servicePreferences && typeof vehicle.servicePreferences === 'object' ? vehicle.servicePreferences : {}),
+      };
+      const servicePreferences = Object.fromEntries(
+        approvedServiceCodes.map((code) => [String(code).toUpperCase(), rawPreferences[String(code).toUpperCase()] !== false]),
+      );
+      return res.json({
+        vehicleType: vehicle?.vehicleType || ctx.driver.vehicleType || ctx.driver.requestedVehicleType || 'MOTORBIKE',
+        requestedServiceCodes,
+        approvedServiceCodes,
+        servicePreferences,
+        vehicleStatus: vehicle?.status || 'PENDING',
+      });
+    } catch (error) { return res.status(500).json({ message: error.message }); }
+  });
+
+  router.post('/services/preferences', async (req, res) => {
+    try {
+      const db = getDb();
+      const ctx = await findDriverContext(db, req, findDriverByPhone);
+      if (!ctx) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
+      const vehicle = await db.collection('vehicles').findOne({ driverId: ctx.driver._id, status: 'APPROVED' }, { sort: { updatedAt: -1 } });
+      if (!vehicle) return res.status(409).json({ message: 'Phương tiện chưa được duyệt.' });
+      const approvedServiceCodes = Array.isArray(vehicle.approvedServiceCodes) && vehicle.approvedServiceCodes.length
+        ? vehicle.approvedServiceCodes.map((code) => String(code).toUpperCase())
+        : (Array.isArray(vehicle.serviceCodes) ? vehicle.serviceCodes.map((code) => String(code).toUpperCase()) : [String(vehicle.serviceCode || 'BIKE').toUpperCase()]);
+      const input = req.body?.servicePreferences && typeof req.body.servicePreferences === 'object'
+        ? req.body.servicePreferences
+        : {};
+      const servicePreferences = Object.fromEntries(
+        approvedServiceCodes.map((code) => [code, input[code] !== false]),
+      );
+      if (!Object.values(servicePreferences).some(Boolean)) {
+        return res.status(400).json({ message: 'Phải bật ít nhất một dịch vụ nhận đơn.' });
+      }
+      const changedAt = new Date();
+      await Promise.all([
+        db.collection('vehicles').updateOne({ _id: vehicle._id }, { $set: { servicePreferences, updatedAt: changedAt } }),
+        db.collection('drivers').updateOne({ _id: ctx.driver._id }, { $set: { servicePreferences, updatedAt: changedAt } }),
+      ]);
+      return res.json({ ok: true, approvedServiceCodes, servicePreferences });
+    } catch (error) { return res.status(400).json({ message: error.message }); }
+  });
+
   router.get('/trips', async (req, res) => {
     try {
       const db=getDb(); const ctx=await findDriverContext(db,req,findDriverByPhone);

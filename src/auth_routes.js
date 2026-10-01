@@ -8,6 +8,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const { sendOtpSms, assertOtpThrottle } = require('./otp_delivery_service');
 const { ObjectId } = require('mongodb');
 
 const router = express.Router();
@@ -527,6 +528,26 @@ function createAuthRouter({
             });
         }
 
+        const verificationToken = String(req.body?.verificationToken || '').trim();
+        const requireOtp = String(process.env.CUSTOMER_REGISTER_REQUIRE_OTP || 'true').toLowerCase() !== 'false';
+        if (requireOtp) {
+          if (!verificationToken) {
+            return res.status(400).json({ code: 'OTP_REQUIRED', message: 'Vui lòng xác thực OTP số điện thoại trước khi đăng ký.' });
+          }
+          try {
+            ensureSecret();
+            const verified = jwt.verify(verificationToken, JWT_ACCESS_SECRET, {
+              issuer: 'th79-imove',
+              audience: 'th79-imove-apps',
+            });
+            if (verified?.kind !== 'OTP_VERIFICATION' || normalizePhone(verified?.phone) !== phone || !['CUSTOMER_PHONE_VERIFY','PHONE_VERIFY'].includes(String(verified?.purpose || '').toUpperCase())) {
+              return res.status(400).json({ code: 'OTP_INVALID', message: 'Phiên xác thực OTP không hợp lệ.' });
+            }
+          } catch (_) {
+            return res.status(400).json({ code: 'OTP_EXPIRED', message: 'Phiên xác thực OTP đã hết hạn. Vui lòng gửi lại mã.' });
+          }
+        }
+
         let user =
           await db
             .collection('users')
@@ -907,6 +928,92 @@ function createAuthRouter({
     },
   );
 
+
+  // ============================================
+  // GENERIC PHONE OTP (non-breaking v1.7.1)
+  // ============================================
+
+  router.post('/otp/request', async (req, res) => {
+    try {
+      const db = getDb();
+      const phone = normalizePhone(req.body?.phone);
+      const purpose = String(req.body?.purpose || 'PHONE_VERIFY').trim().toUpperCase();
+      const allowed = new Set([
+        'PHONE_VERIFY',
+        'CUSTOMER_PHONE_VERIFY',
+        'MERCHANT_PHONE_VERIFY',
+        'PASSWORD_RESET',
+      ]);
+      if (!validatePhone(phone)) {
+        return res.status(400).json({ message: 'Số điện thoại không hợp lệ.' });
+      }
+      if (!allowed.has(purpose)) {
+        return res.status(400).json({ message: 'Mục đích OTP không hợp lệ.' });
+      }
+      await assertOtpThrottle(db, { phone, purpose });
+      const otp = generateOtp();
+      const createdAt = now();
+      const expiresAt = new Date(Date.now() + OTP_MINUTES * 60 * 1000);
+      await db.collection('otp_verifications').insertOne({
+        phone,
+        purpose,
+        codeHash: sha256(otp),
+        createdAt,
+        expiresAt,
+        usedAt: null,
+      });
+      const delivery = await sendOtpSms({ phone, otp, purpose });
+      const response = {
+        ok: true,
+        delivered: Boolean(delivery?.delivered),
+        message: `OTP có hiệu lực ${OTP_MINUTES} phút.`,
+        expiresAt: expiresAt.toISOString(),
+      };
+      if (DEV_SHOW_OTP) response.devOtp = otp;
+      return res.json(response);
+    } catch (error) {
+      if (error?.retryAfter) res.setHeader('Retry-After', String(error.retryAfter));
+      return res.status(Number(error?.httpStatus) || 503).json({ message: error.message });
+    }
+  });
+
+  router.post('/otp/verify', async (req, res) => {
+    try {
+      const db = getDb();
+      const phone = normalizePhone(req.body?.phone);
+      const purpose = String(req.body?.purpose || 'PHONE_VERIFY').trim().toUpperCase();
+      const code = String(req.body?.otpCode || '').trim();
+      if (!validatePhone(phone) || !/^\d{6}$/.test(code)) {
+        return res.status(400).json({ message: 'OTP hoặc số điện thoại không hợp lệ.' });
+      }
+      const record = await db.collection('otp_verifications').findOne({
+        phone,
+        purpose,
+        codeHash: sha256(code),
+        usedAt: null,
+        expiresAt: { $gt: now() },
+      }, { sort: { createdAt: -1 } });
+      if (!record) return res.status(400).json({ message: 'OTP không đúng hoặc đã hết hạn.' });
+      await db.collection('otp_verifications').updateOne(
+        { _id: record._id, usedAt: null },
+        { $set: { usedAt: now() } },
+      );
+      ensureSecret();
+      const verificationToken = jwt.sign(
+        { phone, purpose, kind: 'OTP_VERIFICATION' },
+        JWT_ACCESS_SECRET,
+        {
+          issuer: 'th79-imove',
+          audience: 'th79-imove-apps',
+          expiresIn: 10 * 60,
+        },
+      );
+      return res.json({ ok: true, phone, purpose, verificationToken, expiresIn: 600 });
+    } catch (error) {
+      return res.status(500).json({ message: error.message });
+    }
+  });
+
   // ============================================
   // DRIVER REQUEST OTP
   // ============================================
@@ -965,6 +1072,8 @@ function createAuthRouter({
             });
         }
 
+        await assertOtpThrottle(db, { phone, purpose: 'DRIVER_REGISTER' });
+
         const otp =
           generateOtp();
 
@@ -1002,8 +1111,15 @@ function createAuthRouter({
               null,
           });
 
+        const delivery = await sendOtpSms({
+          phone,
+          otp,
+          purpose: 'DRIVER_REGISTER',
+        });
+
         const response = {
           ok: true,
+          delivered: Boolean(delivery?.delivered),
 
           message:
             `OTP có hiệu lực ${OTP_MINUTES} phút.`,
@@ -1025,8 +1141,11 @@ function createAuthRouter({
           response,
         );
       } catch (error) {
+        if (error?.retryAfter) {
+          res.setHeader('Retry-After', String(error.retryAfter));
+        }
         return res
-          .status(500)
+          .status(Number(error?.httpStatus) || 503)
           .json({
             message:
               error.message,
@@ -1081,6 +1200,22 @@ function createAuthRouter({
               ?.otpCode ||
             '',
           ).trim();
+
+        const vehicleType = String(req.body?.vehicleType || 'MOTORBIKE').trim().toUpperCase();
+        const requestedServiceCodes = Array.isArray(req.body?.requestedServiceCodes)
+          ? [...new Set(req.body.requestedServiceCodes.map((x) => String(x || '').trim().toUpperCase()).filter(Boolean))]
+          : [];
+        const allowedVehicleTypes = new Set(['MOTORBIKE','CAR_4','CAR_7','MPV_7','LUXURY','VAN','TRUCK']);
+        const motorbikeServices = new Set(['BIKE','FOOD','ERRAND','DELIVERY']);
+        if (!allowedVehicleTypes.has(vehicleType)) {
+          return res.status(400).json({ message: 'Loại phương tiện không hợp lệ.' });
+        }
+        if (vehicleType === 'MOTORBIKE') {
+          const invalid = requestedServiceCodes.find((code) => !motorbikeServices.has(code));
+          if (invalid || requestedServiceCodes.length === 0) {
+            return res.status(400).json({ message: 'Xe máy phải chọn ít nhất một dịch vụ BIKE/FOOD/MARKET/DELIVERY.' });
+          }
+        }
 
         if (
           fullName.length < 2 ||
@@ -1269,6 +1404,14 @@ function createAuthRouter({
 
             onlineStatus:
               'OFFLINE',
+
+            vehicleType,
+            requestedServiceCodes,
+            approvedServiceCodes: [],
+            serviceCapabilities: [],
+            servicePreferences: Object.fromEntries(
+              requestedServiceCodes.map((code) => [code, false]),
+            ),
 
             rating:
               5,

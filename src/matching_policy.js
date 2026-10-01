@@ -13,6 +13,12 @@ const DEFAULT_MATCHING_POLICY = Object.freeze({
   maxRadiusKm: 12,
   locationFreshSeconds: 90,
   maxCandidates: 100,
+  dispatchRounds: [
+    { radiusKm: 2, maxCandidates: 5, offerTimeoutSeconds: 6 },
+    { radiusKm: 4, maxCandidates: 8, offerTimeoutSeconds: 7 },
+    { radiusKm: 8, maxCandidates: 12, offerTimeoutSeconds: 8 },
+    { radiusKm: 12, maxCandidates: 16, offerTimeoutSeconds: 10 },
+  ],
   allowNoGpsFallback: false,
   pointsPolicy: {
     blockBelow: 0,
@@ -80,6 +86,28 @@ function boolValue(value, fallback) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }
 
+
+function normalizeDispatchRounds(raw, defaults = DEFAULT_MATCHING_POLICY.dispatchRounds) {
+  const input = Array.isArray(raw) && raw.length ? raw : defaults;
+  const rows = input.slice(0, 4).map((round, index) => {
+    const fallback = defaults[Math.min(index, defaults.length - 1)] || defaults[defaults.length - 1];
+    return {
+      radiusKm: clampNumber(round?.radiusKm, fallback.radiusKm, 0.5, 100),
+      maxCandidates: clampInt(round?.maxCandidates, fallback.maxCandidates, 1, 200),
+      offerTimeoutSeconds: clampInt(round?.offerTimeoutSeconds, fallback.offerTimeoutSeconds, 3, 120),
+    };
+  });
+  while (rows.length < 4) {
+    const fallback = defaults[Math.min(rows.length, defaults.length - 1)] || defaults[defaults.length - 1];
+    rows.push({ ...fallback });
+  }
+  // Round sau không được nhỏ hơn Round trước về bán kính.
+  for (let i = 1; i < rows.length; i += 1) {
+    rows[i].radiusKm = Math.max(rows[i - 1].radiusKm, rows[i].radiusKm);
+  }
+  return rows;
+}
+
 function normalizeWeights(raw = {}) {
   const defaults = DEFAULT_MATCHING_POLICY.weights;
   return {
@@ -100,6 +128,7 @@ function normalizeMatchingPolicy(raw = {}, runtimeDefaults = {}) {
     weights: { ...DEFAULT_MATCHING_POLICY.weights, ...(runtimeDefaults.weights || {}) },
     fairness: { ...DEFAULT_MATCHING_POLICY.fairness, ...(runtimeDefaults.fairness || {}) },
     pointsPolicy: { ...DEFAULT_MATCHING_POLICY.pointsPolicy, ...(runtimeDefaults.pointsPolicy || {}) },
+    dispatchRounds: normalizeDispatchRounds(runtimeDefaults.dispatchRounds, DEFAULT_MATCHING_POLICY.dispatchRounds),
   };
 
   const strategy = String(raw.strategy || defaults.strategy || 'BALANCED').trim().toUpperCase();
@@ -122,6 +151,9 @@ function normalizeMatchingPolicy(raw = {}, runtimeDefaults = {}) {
     ),
   );
 
+  const dispatchRounds = normalizeDispatchRounds(raw.dispatchRounds, defaults.dispatchRounds);
+  const roundMaxRadius = Math.max(...dispatchRounds.map((round) => round.radiusKm));
+
   return {
     key: POLICY_KEY,
     version: clampInt(raw.version, defaults.version || 1, 1, 999999),
@@ -130,7 +162,8 @@ function normalizeMatchingPolicy(raw = {}, runtimeDefaults = {}) {
     autoDispatchEnabled: boolValue(raw.autoDispatchEnabled, defaults.autoDispatchEnabled),
     offerTimeoutSeconds: clampInt(raw.offerTimeoutSeconds, defaults.offerTimeoutSeconds, 5, 120),
     searchRetrySeconds: clampInt(raw.searchRetrySeconds, defaults.searchRetrySeconds, 2, 60),
-    maxRadiusKm: clampNumber(raw.maxRadiusKm, defaults.maxRadiusKm, 0.5, 100),
+    maxRadiusKm: Math.max(roundMaxRadius, clampNumber(raw.maxRadiusKm, defaults.maxRadiusKm, 0.5, 100)),
+    dispatchRounds,
     locationFreshSeconds: clampInt(raw.locationFreshSeconds, defaults.locationFreshSeconds, 10, 300),
     maxCandidates: clampInt(raw.maxCandidates, defaults.maxCandidates, 5, 200),
     allowNoGpsFallback: boolValue(raw.allowNoGpsFallback, defaults.allowNoGpsFallback),

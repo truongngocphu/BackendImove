@@ -1,12 +1,12 @@
 {
   "name": "imove-platform-api",
-  "version": "1.6.0",
+  "version": "1.7.1",
   "private": true,
   "type": "commonjs",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "check": "node --check src/admin_auth_routes.js && node --check src/admin_console_routes.js && node --check src/admin_guard.js && node --check src/service_catalog_service.js && node --check src/service_catalog_routes.js && node --check src/pricing_service.js && node --check src/pricing_routes.js && node --check src/promotion_service.js && node --check src/promotion_routes.js && node --check src/admin_ops_routes.js && node --check src/auth_routes.js && node --check src/booking_security.js && node --check src/database_repair.js && node --check src/broadcast_routes.js && node --check src/dispatch_admin_routes.js && node --check src/dispatch_engine.js && node --check src/driver_experience_routes.js && node --check src/driver_location_service.js && node --check src/fare_engine.js && node --check src/kyc_crypto.js && node --check src/kyc_routes.js && node --check src/lan_discovery.js && node --check src/matching_admin_routes.js && node --check src/matching_engine.js && node --check src/matching_policy.js && node --check src/notification_service.js && node --check src/platform_service.js && node --check src/production_guard.js && node --check src/production_routes.js && node --check src/production_service.js && node --check src/map_service.js && node --check src/map_routes.js && node --check src/commerce_routes.js && node --check src/server.js && node --check src/trust_routes.js && node --check src/trust_service.js && node --check src/analytics_service.js && node --check src/analytics_routes.js && node --check src/system_roles.js && node --check src/driver_history_service.js",
+    "check": "node --check src/admin_auth_routes.js && node --check src/admin_console_routes.js && node --check src/admin_guard.js && node --check src/service_catalog_service.js && node --check src/service_catalog_routes.js && node --check src/pricing_service.js && node --check src/pricing_routes.js && node --check src/promotion_service.js && node --check src/promotion_routes.js && node --check src/admin_ops_routes.js && node --check src/auth_routes.js && node --check src/booking_security.js && node --check src/database_repair.js && node --check src/broadcast_routes.js && node --check src/dispatch_admin_routes.js && node --check src/dispatch_engine.js && node --check src/driver_experience_routes.js && node --check src/driver_location_service.js && node --check src/fare_engine.js && node --check src/kyc_crypto.js && node --check src/kyc_routes.js && node --check src/lan_discovery.js && node --check src/matching_admin_routes.js && node --check src/matching_engine.js && node --check src/matching_policy.js && node --check src/notification_service.js && node --check src/platform_service.js && node --check src/production_guard.js && node --check src/production_routes.js && node --check src/production_service.js && node --check src/map_service.js && node --check src/map_routes.js && node --check src/commerce_routes.js && node --check src/otp_delivery_service.js && node --check src/fund_topup_routes.js && node --check src/server.js && node --check src/trust_routes.js && node --check src/trust_service.js && node --check src/analytics_service.js && node --check src/analytics_routes.js && node --check src/system_roles.js && node --check src/driver_history_service.js",
     "db:migrate": "node scripts/migrate_database_validators.js && node scripts/migrate_notifications.js && node scripts/migrate_financial_ledger.js && node scripts/migrate_commerce_schema.js",
     "db:seed": "node scripts/seed_fare_tables.js && node scripts/seed_matching_policy.js && node scripts/seed_dispatch_policy.js && node scripts/seed_trust_policy.js && node scripts/seed_notification_policy.js && node scripts/seed_driver_experience.js && node scripts/seed_production_settings.js",
     "verify": "node scripts/verify_dispatch.js && node scripts/verify_trust_safety.js && node scripts/verify_notifications.js && node scripts/verify_driver_experience.js && node scripts/verify_production.js",
@@ -18,7 +18,9 @@
     "db:repair": "node scripts/migrate_database_validators.js",
     "db:seed:merchant": "node scripts/seed_merchant_demo.js",
     "db:migrate:commerce": "node scripts/migrate_commerce_schema.js",
-    "check:vps": "node scripts/check_vps_config.js"
+    "check:vps": "node scripts/check_vps_config.js",
+    "tune:matching-fast": "node scripts/apply_fast_matching.js",
+    "sms:speedsms:info": "node scripts/test_speedsms_account.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

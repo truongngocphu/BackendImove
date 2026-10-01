@@ -1,7 +1,5 @@
 const dgram = require('dgram');
 const os = require('os');
-const { version: PACKAGE_VERSION } = require('../package.json');
-const APP_VERSION = String(process.env.APP_VERSION || PACKAGE_VERSION || '1.6.0').trim();
 
 const DISCOVERY_MAGIC = 'TH79_IMOVE_DISCOVER_V2';
 const SERVICE_NAME = 'TH79_IMOVE_CORE';
@@ -48,9 +46,7 @@ function getLanAddresses() {
 }
 
 function startLanDiscovery({ httpPort, discoveryPort = 5051 }) {
-  const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
-  const defaultEnabled = production ? 'false' : 'true';
-  const enabled = String(process.env.LAN_DISCOVERY_ENABLED ?? defaultEnabled).toLowerCase() === 'true';
+  const enabled = String(process.env.LAN_DISCOVERY_ENABLED || 'true').toLowerCase() !== 'false';
 
   if (!enabled) return { close() {} };
 
@@ -67,7 +63,7 @@ function startLanDiscovery({ httpPort, discoveryPort = 5051 }) {
     const payload = Buffer.from(JSON.stringify({
       service: SERVICE_NAME,
       discoveryMagic: DISCOVERY_MAGIC,
-      version: APP_VERSION,
+      version: '5.7.0',
       port: Number(httpPort),
       database: process.env.MONGODB_DB || 'th79_imove',
       hostname: os.hostname(),
@@ -93,11 +89,6 @@ function startLanDiscovery({ httpPort, discoveryPort = 5051 }) {
 }
 
 function startServiceRegistry({ getDb, httpPort, discoveryPort = 5051 }) {
-  const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
-  const defaultEnabled = production ? 'false' : 'true';
-  const enabled = String(process.env.SERVICE_REGISTRY_ENABLED ?? defaultEnabled).toLowerCase() === 'true';
-  if (!enabled) return { async refresh() {}, close() {} };
-
   const intervalMs = Math.max(3000, Number(process.env.SERVICE_REGISTRY_HEARTBEAT_MS || 5000));
   const ttlSeconds = Math.max(30, Number(process.env.SERVICE_REGISTRY_TTL_SECONDS || 90));
   const instanceId = `${os.hostname()}-${process.pid}`;
@@ -132,7 +123,7 @@ function startServiceRegistry({ getDb, httpPort, discoveryPort = 5051 }) {
             service: SERVICE_NAME,
             instanceId,
             hostname: os.hostname(),
-            version: APP_VERSION,
+            version: '5.7.0',
             databaseName: process.env.MONGODB_DB || 'th79_imove',
             httpPort: Number(httpPort),
             discoveryPort: Number(discoveryPort),

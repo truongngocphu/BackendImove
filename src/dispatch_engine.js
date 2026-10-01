@@ -7,16 +7,14 @@ const DEFAULT_CONFIG = {
   key: 'BIKE_V69_DISPATCH',
   enabled: true,
   maxRounds: 4,
-  // FAST MATCHING production profile:
-  // round 1 fans out immediately to more nearby drivers, then expands quickly.
   rounds: [
-    { round: 1, candidateCount: 5, radiusKm: 3, timeoutSeconds: 7 },
-    { round: 2, candidateCount: 8, radiusKm: 5, timeoutSeconds: 7 },
-    { round: 3, candidateCount: 12, radiusKm: 8, timeoutSeconds: 8 },
-    { round: 4, candidateCount: 20, radiusKm: 12, timeoutSeconds: 10 },
+    { round: 1, candidateCount: 3, radiusKm: 2, timeoutSeconds: 12 },
+    { round: 2, candidateCount: 5, radiusKm: 4, timeoutSeconds: 15 },
+    { round: 3, candidateCount: 8, radiusKm: 7, timeoutSeconds: 20 },
+    { round: 4, candidateCount: 15, radiusKm: 10, timeoutSeconds: 25 },
   ],
-  cooldown: { declineSeconds: 30, timeoutSeconds: 10, sameBookingSeconds: 180 },
-  retry: { maxDispatchRetries: 3, retryDelaySeconds: [1, 2, 5] },
+  cooldown: { declineSeconds: 60, timeoutSeconds: 30, sameBookingSeconds: 600 },
+  retry: { maxDispatchRetries: 3, retryDelaySeconds: [3, 10, 30] },
 };
 
 function normalizeConfig(raw = {}) {
@@ -143,7 +141,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     let nextRound = Number(booking?.dispatchEngine?.currentRound || 0) + 1;
     if (reset || dispatchVersion === 0) { dispatchVersion += 1; nextRound = 1; }
     if (nextRound > cfg.maxRounds || nextRound > cfg.rounds.length) {
-      const retryDelay = Math.max(1, Number(cfg.retry?.retryDelaySeconds?.[0] || 1));
+      const retryDelay = Math.max(3, Number(cfg.retry?.retryDelaySeconds?.[0] || 5));
       const nextRetryAt = new Date(Date.now() + retryDelay * 1000);
       await db.collection('bookings').updateOne(
         { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
@@ -167,7 +165,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       if (candidates.length >= roundCfg.candidateCount) break;
     }
     if (!candidates.length) {
-      const delaySeconds = Math.max(1, Math.min(5, Number(cfg.retry?.retryDelaySeconds?.[0] || 1)));
+      const delaySeconds = Math.max(2, Math.min(10, Number(cfg.retry?.retryDelaySeconds?.[0] || 3)));
       const nextRetryAt = new Date(Date.now() + delaySeconds * 1000);
       await db.collection('bookings').updateOne(
         { _id: bookingId },

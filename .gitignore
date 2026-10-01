@@ -1,7 +1,6 @@
 .env
 node_modules/
 reports/
-logs/
 storage/kyc/
 .DS_Store
 Thumbs.db

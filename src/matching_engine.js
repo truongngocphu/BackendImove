@@ -399,11 +399,33 @@ function createMatchingEngine({
     }
   }
 
+  function driverServiceEnabled(driver, serviceCode) {
+    const code = String(serviceCode || 'BIKE').toUpperCase();
+    const approved = Array.isArray(driver?.approvedServiceCodes)
+      ? driver.approvedServiceCodes.map((x) => String(x || '').toUpperCase()).filter(Boolean)
+      : [];
+    const prefs = driver?.servicePreferences && typeof driver.servicePreferences === 'object'
+      ? driver.servicePreferences
+      : null;
+    if (approved.length) {
+      return approved.includes(code) && !(prefs && prefs[code] === false);
+    }
+    const legacy = Array.isArray(driver?.serviceCapabilities)
+      ? driver.serviceCapabilities.map((x) => String(x || '').toUpperCase()).filter(Boolean)
+      : [];
+    if (!legacy.length) return true;
+    if (prefs && prefs[code] === false) return false;
+    if (legacy.includes(code)) return true;
+    if (['FOOD','ERRAND','DELIVERY'].includes(code) && legacy.includes('BIKE')) return true;
+    return false;
+  }
+
   async function getDriverContextById(driverId, serviceCode = null) {
     const db = getDb();
     if (!db) return null;
     const driver = await db.collection('drivers').findOne({ _id: driverId });
     if (!driver) return null;
+    if (serviceCode && !driverServiceEnabled(driver, serviceCode)) return null;
     const user = await db.collection('users').findOne({ _id: driver.userId });
     const vehicleQuery = { driverId: driver._id, status: 'APPROVED' };
     if (serviceCode) vehicleQuery.$or = [{ serviceCodes: String(serviceCode).toUpperCase() }, { serviceCode: String(serviceCode).toUpperCase() }];
