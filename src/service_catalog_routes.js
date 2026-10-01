@@ -1,6 +1,0 @@
-const express=require('express');
-const {createAdminGuard}=require('./admin_guard');
-function serialize(x){return {...x,_id:x?._id?String(x._id):undefined,createdAt:x?.createdAt||null,updatedAt:x?.updatedAt||null};}
-function createServiceCatalogPublicRouter({getCatalog}){const r=express.Router();r.get('/',async(_req,res)=>{try{const rows=await getCatalog().listActive();return res.json({services:rows.map(serialize)});}catch(e){return res.status(500).json({message:e.message});}});return r;}
-function createServiceCatalogAdminRouter({getDb,getCatalog}){const r=express.Router();const {requireAdmin,permit}=createAdminGuard({getDb});r.use(requireAdmin);r.get('/',permit('services.view'),async(_req,res)=>res.json({services:(await getCatalog().listAll()).map(serialize)}));r.put('/:code',permit('services.manage'),async(req,res)=>{try{const value=await getCatalog().saveService({...req.body,code:req.params.code},req.admin._id);await getDb().collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'SERVICE_CATALOG_UPDATE',entityType:'SERVICE',entityId:req.params.code,after:value,createdAt:new Date()});res.json(serialize(value));}catch(e){res.status(400).json({message:e.message});}});return r;}
-module.exports={createServiceCatalogPublicRouter,createServiceCatalogAdminRouter};

@@ -1,2 +1,0 @@
-require('dotenv').config();const {MongoClient}=require('mongodb');const {createTrustService}=require('../src/trust_service');
-(async()=>{const c=new MongoClient(process.env.MONGODB_URI);await c.connect();const db=c.db(process.env.MONGODB_DB||'th79_imove');const s=createTrustService({getDb:()=>db});await s.databaseReady();console.log('[V7.0] Trust & Safety indexes/rules ready');await c.close();})().catch(e=>{console.error(e);process.exit(1)});

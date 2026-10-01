@@ -1,4 +1,0 @@
-const test=require('node:test');const assert=require('node:assert/strict');
-const {calculateVersionedFare}=require('../src/pricing_service');
-test('CAR_4 uses versioned config',()=>{const r=calculateVersionedFare({config:{baseFare:20000,baseDistanceKm:2,minimumFare:25000,pricePerMinute:450,roundingUnit:1000,distanceTiers:[{fromKm:2,toKm:null,pricePerKm:12000}]},fees:{bookingFee:0,customerServiceFee:0,driverFixedFee:0,paymentFeePercent:0,driverCommission:{type:'PERCENT',value:20}},distanceKm:5,durationMinutes:12,multipliers:{surge:1,rush:1,night:1},surcharges:[]});assert.equal(r.total>=25000,true);assert.equal(r.breakdown.baseFare,20000);assert.equal(r.driverNetAmount>0,true)});
-test('missing fare config is rejected',()=>assert.throws(()=>calculateVersionedFare({config:null,distanceKm:2,durationMinutes:5}),/FARE_CONFIG_NOT_FOUND/));
