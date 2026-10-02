@@ -77,6 +77,8 @@ function redactForLog(value, depth = 0) {
     return { name: value.name, message: value.message, code: value.code || null, stack: value.stack || null };
   }
   if (Array.isArray(value)) return value.slice(0, 20).map((item) => redactForLog(item, depth + 1));
+  if (value && typeof value.toHexString === 'function') { try { return value.toHexString(); } catch (_) {} }
+  if (Buffer.isBuffer(value)) return `[Buffer ${value.length} bytes]`;
   if (typeof value !== 'object') return value;
   const blocked = /password|pass|token|authorization|cookie|secret|private.?key|mongo.*uri|api.?key|credential/i;
   const out = {};
@@ -126,7 +128,7 @@ app.use((req, res, next) => {
           params: req.params,
           query: req.query,
           body: req.body,
-          authUserId: req.auth?.user?._id || null,
+          authUserId: req.auth?.user?._id ? String(req.auth.user._id) : null,
         });
     } else if (String(process.env.LOG_HTTP_SUCCESS || 'false').toLowerCase() === 'true') {
       diagnosticLog('INFO', 'HTTP', `${req.method} ${req.originalUrl} -> ${res.statusCode} (${elapsedMs}ms)`, { requestId });
@@ -151,6 +153,10 @@ app.use((req, res, next) => {
 });
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors(buildCorsOptions()));
+app.use((_req, res, next) => {
+  res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id, X-IMove-Driver-Status, X-IMove-Reason');
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: Math.max(60, Number(process.env.API_RATE_LIMIT_PER_MINUTE || 600)), standardHeaders: 'draft-7', legacyHeaders: false }));
 
@@ -910,7 +916,10 @@ app.post('/api/drivers/status', requireApprovedDriver, async (req, res) => {
       } catch (_) {}
     }
 
-    return res.json({ ok: true, onlineStatus, pointStatus });
+    diagnosticLog('INFO', 'DRIVER_STATUS', `Driver ${onlineStatus}`, {
+      driverId: String(found.driver._id), phone, onlineStatus, requestId: req.requestId || null,
+    });
+    return res.json({ ok: true, onlineStatus, pointStatus, serverTime: statusChangedAt });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -1078,19 +1087,33 @@ app.get('/api/bookings/available', requireApprovedDriver, async (req, res) => {
     if (found.driver.approvalStatus !== 'APPROVED' || found.driver.kycStatus !== 'APPROVED') {
       return res.status(403).json({ message: 'Tài xế chưa được duyệt đầy đủ KYC.' });
     }
-    // BUSY is an expected state while the driver is performing a trip.
-    // The Driver app may still issue a fallback poll during route transitions;
-    // return an empty offer list instead of a noisy 403. OFFLINE remains forbidden.
+    // Polling từ Driver app cũng là tín hiệu presence khi app đang hoạt động.
+    // BUSY/OFFLINE là trạng thái bình thường, không trả 403 liên tục gây spam log/F12.
     if (found.driver.onlineStatus === 'BUSY') {
+      res.setHeader('X-IMove-Driver-Status', 'BUSY');
       return res.json([]);
     }
     if (found.driver.onlineStatus !== 'ONLINE') {
-      return res.status(403).json({ message: 'Tài xế đang OFFLINE.' });
+      res.setHeader('X-IMove-Driver-Status', String(found.driver.onlineStatus || 'OFFLINE'));
+      res.setHeader('X-IMove-Reason', 'DRIVER_OFFLINE');
+      diagnosticLog('INFO', 'DRIVER_POLL', 'Driver poll khi đang OFFLINE', {
+        driverId: String(found.driver._id), phone: driverPhone, requestId: req.requestId || null,
+      });
+      return res.json([]);
     }
+
+    const pollSeenAt = now();
+    await db.collection('drivers').updateOne(
+      { _id: found.driver._id, onlineStatus: 'ONLINE' },
+      { $set: { lastHeartbeatAt: pollSeenAt, lastSeenAt: pollSeenAt, updatedAt: pollSeenAt } },
+    );
+    res.setHeader('X-IMove-Driver-Status', 'ONLINE');
+
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
     return res.json(await matching.getAvailableOffers(found.driver._id));
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    logError('BOOKINGS_AVAILABLE', error, { requestId: req.requestId || null, phone: req.auth?.user?.phone || null });
+    return res.status(500).json({ message: error.message, requestId: req.requestId || null });
   }
 });
 
@@ -1685,7 +1708,10 @@ const driverPresenceTimer = setInterval(async () => {
       { $set: { onlineStatus: 'OFFLINE', presenceExpiredAt: changedAt, updatedAt: changedAt } },
     );
     if (result.modifiedCount > 0) {
-      console.log(`[Presence] Đã chuyển ${result.modifiedCount} tài xế ONLINE cũ sang OFFLINE.`);
+      diagnosticLog('WARN', 'PRESENCE', `Đã chuyển ${result.modifiedCount} tài xế ONLINE cũ sang OFFLINE`, {
+        cutoff: cutoff.toISOString(), freshMs: DRIVER_PRESENCE_FRESH_MS,
+        reason: 'Không có heartbeat/location/poll mới trong thời gian cho phép',
+      });
     }
   } catch (error) {
     logError('PRESENCE_SWEEP', error);
