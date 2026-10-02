@@ -30,6 +30,17 @@ function publicAdmin(user) {
   };
 }
 
+function errorPayload(req, code, message, details = null) {
+  return {
+    ok: false,
+    success: false,
+    code,
+    message,
+    requestId: req?.requestId || null,
+    ...(details ? { details } : {}),
+  };
+}
+
 function createAdminAuthRouter({ getDb }) {
   const router = express.Router();
 
@@ -58,9 +69,7 @@ function createAdminAuthRouter({ getDb }) {
     }
 
     if (current.count >= maxAttempts) {
-      return res.status(429).json({
-        message: 'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau.',
-      });
+      return res.status(429).json(errorPayload(req, 'ADMIN_LOGIN_RATE_LIMITED', 'Đăng nhập sai quá nhiều lần. Vui lòng thử lại sau.'));
     }
 
     next();
@@ -83,11 +92,37 @@ function createAdminAuthRouter({ getDb }) {
     attempts.delete(clientKey(req));
   }
 
+  // Public compatibility health. The Admin login page can call this before it has a token.
+  router.get('/health', async (req, res) => {
+    try {
+      const db = getDb();
+      if (!db) return res.status(503).json(errorPayload(req, 'DATABASE_NOT_READY', 'Core Backend đang chạy nhưng database chưa sẵn sàng.'));
+      const started = Date.now();
+      const pong = await db.command({ ping: 1 });
+      const ok = pong?.ok === 1;
+      return res.status(ok ? 200 : 503).json({
+        ok,
+        success: ok,
+        ready: ok,
+        backend: true,
+        coreBackend: true,
+        database: ok,
+        service: 'TH79_IMOVE_CORE',
+        component: 'ADMIN_AUTH',
+        latencyMs: Date.now() - started,
+        requestId: req.requestId || null,
+      });
+    } catch (error) {
+      console.error('[ADMIN_AUTH_HEALTH]', error);
+      return res.status(503).json(errorPayload(req, 'ADMIN_AUTH_HEALTH_FAILED', error.message));
+    }
+  });
+
   async function requireAdmin(req, res, next) {
     try {
       const header = String(req.headers.authorization || '');
       if (!header.startsWith('Bearer ')) {
-        return res.status(401).json({ message: 'Thiếu Access Token.' });
+        return res.status(401).json(errorPayload(req, 'ADMIN_TOKEN_MISSING', 'Thiếu Access Token.'));
       }
 
       const token = header.slice(7).trim();
@@ -95,12 +130,12 @@ function createAdminAuthRouter({ getDb }) {
       const userId = safeObjectId(payload.sub || payload.userId);
 
       if (!userId) {
-        return res.status(401).json({ message: 'Access Token không hợp lệ.' });
+        return res.status(401).json(errorPayload(req, 'ADMIN_TOKEN_INVALID', 'Access Token không hợp lệ.'));
       }
 
       const db = getDb();
       if (!db) {
-        return res.status(503).json({ message: 'Database chưa sẵn sàng.' });
+        return res.status(503).json(errorPayload(req, 'DATABASE_NOT_READY', 'Database chưa sẵn sàng.', { action: 'Kiểm tra /health và kết nối MongoDB Atlas.' }));
       }
 
       const user = await db.collection('users').findOne({
@@ -109,20 +144,18 @@ function createAdminAuthRouter({ getDb }) {
       });
 
       if (!user) {
-        return res.status(403).json({ message: 'Tài khoản không có quyền ADMIN.' });
+        return res.status(403).json(errorPayload(req, 'ADMIN_PERMISSION_REQUIRED', 'Tài khoản không có quyền ADMIN.'));
       }
 
       const status = String(user.status || 'ACTIVE').toUpperCase();
       if (['BLOCKED', 'DISABLED', 'DELETED', 'INACTIVE'].includes(status)) {
-        return res.status(403).json({ message: 'Tài khoản quản trị đã bị khóa.' });
+        return res.status(403).json(errorPayload(req, 'ADMIN_ACCOUNT_DISABLED', 'Tài khoản quản trị đã bị khóa.'));
       }
 
       req.admin = user;
       next();
     } catch (_) {
-      return res.status(401).json({
-        message: 'Phiên quản trị không hợp lệ hoặc đã hết hạn.',
-      });
+      return res.status(401).json(errorPayload(req, 'ADMIN_SESSION_INVALID', 'Phiên quản trị không hợp lệ hoặc đã hết hạn.'));
     }
   }
 
@@ -130,7 +163,7 @@ function createAdminAuthRouter({ getDb }) {
     try {
       const db = getDb();
       if (!db) {
-        return res.status(503).json({ message: 'Database chưa sẵn sàng.' });
+        return res.status(503).json(errorPayload(req, 'DATABASE_NOT_READY', 'Database chưa sẵn sàng.', { action: 'Kiểm tra /health và kết nối MongoDB Atlas.' }));
       }
 
       const login = String(
@@ -143,9 +176,7 @@ function createAdminAuthRouter({ getDb }) {
       const password = String(req.body?.password || '');
 
       if (!login || !password) {
-        return res.status(400).json({
-          message: 'Vui lòng nhập tài khoản và mật khẩu.',
-        });
+        return res.status(400).json(errorPayload(req, 'ADMIN_CREDENTIALS_REQUIRED', 'Vui lòng nhập tài khoản và mật khẩu.'));
       }
 
       const email = login.toLowerCase();
@@ -160,25 +191,19 @@ function createAdminAuthRouter({ getDb }) {
 
       if (!user || !user.passwordHash) {
         noteFailure(req);
-        return res.status(401).json({
-          message: 'Tài khoản hoặc mật khẩu không đúng.',
-        });
+        return res.status(401).json(errorPayload(req, 'ADMIN_CREDENTIALS_INVALID', 'Tài khoản hoặc mật khẩu không đúng.'));
       }
 
       const status = String(user.status || 'ACTIVE').toUpperCase();
       if (['BLOCKED', 'DISABLED', 'DELETED', 'INACTIVE'].includes(status)) {
-        return res.status(403).json({
-          message: 'Tài khoản quản trị đã bị khóa.',
-        });
+        return res.status(403).json(errorPayload(req, 'ADMIN_ACCOUNT_DISABLED', 'Tài khoản quản trị đã bị khóa.'));
       }
 
       const ok = await bcrypt.compare(password, user.passwordHash);
 
       if (!ok) {
         noteFailure(req);
-        return res.status(401).json({
-          message: 'Tài khoản hoặc mật khẩu không đúng.',
-        });
+        return res.status(401).json(errorPayload(req, 'ADMIN_CREDENTIALS_INVALID', 'Tài khoản hoặc mật khẩu không đúng.'));
       }
 
       clearFailures(req);
@@ -198,17 +223,21 @@ function createAdminAuthRouter({ getDb }) {
       );
 
       return res.json({
+        ok: true,
+        success: true,
         accessToken,
         expiresInSeconds: hours * 60 * 60,
         user: publicAdmin(user),
+        requestId: req.requestId || null,
       });
     } catch (error) {
-      return res.status(500).json({ message: error.message });
+      console.error('[ADMIN_AUTH_LOGIN]', error);
+      return res.status(500).json(errorPayload(req, error.code || 'ADMIN_LOGIN_FAILED', error.message || 'Đăng nhập Admin thất bại.'));
     }
   });
 
   router.get('/me', requireAdmin, async (req, res) => {
-    return res.json({ user: publicAdmin(req.admin) });
+    return res.json({ ok: true, success: true, user: publicAdmin(req.admin), requestId: req.requestId || null });
   });
 
   return router;

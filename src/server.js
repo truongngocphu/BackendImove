@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 const { calculateFare } = require('./fare_engine');
@@ -63,6 +65,35 @@ const SERVICE_REGISTRY_ENABLED = String(
   process.env.SERVICE_REGISTRY_ENABLED ?? (PRODUCTION ? 'false' : 'true'),
 ).toLowerCase() === 'true';
 
+function inspectEnvFile() {
+  const envPath = path.resolve(process.cwd(), '.env');
+  if (!fs.existsSync(envPath)) return { exists: false, duplicates: [] };
+  try {
+    const text = fs.readFileSync(envPath, 'utf8');
+    const seen = new Map();
+    const duplicates = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+      if (!match) continue;
+      const key = match[1];
+      const count = (seen.get(key) || 0) + 1;
+      seen.set(key, count);
+      if (count === 2) duplicates.push(key);
+    }
+    return { exists: true, duplicates };
+  } catch (error) {
+    return { exists: true, duplicates: [], error: error.message };
+  }
+}
+
+const ENV_INSPECTION = inspectEnvFile();
+if (ENV_INSPECTION.duplicates.length) {
+  console.warn(`[ENV] Cảnh báo: .env có biến khai báo lặp: ${ENV_INSPECTION.duplicates.join(', ')}. Giá trị cuối cùng có thể ghi đè giá trị trước.`);
+}
+if (ENV_INSPECTION.error) console.warn('[ENV] Không thể kiểm tra .env:', ENV_INSPECTION.error);
+
 assertProductionConfig();
 
 const app = express();
@@ -117,6 +148,14 @@ app.use((req, res, next) => {
   req.requestId = requestId;
   res.setHeader('X-Request-Id', requestId);
 
+  // Capture JSON responses so PM2 logs show the actual reason returned to the app.
+  // redactForLog() masks passwords, access tokens, cookies and secrets.
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    res.locals.imoveResponseBody = redactForLog(body);
+    return originalJson(body);
+  };
+
   res.on('finish', () => {
     const elapsedMs = Date.now() - startedAt;
     if (res.statusCode >= 400) {
@@ -124,14 +163,21 @@ app.use((req, res, next) => {
         `${req.method} ${req.originalUrl} -> ${res.statusCode} (${elapsedMs}ms)`, {
           requestId,
           ip: req.ip,
+          origin: req.get('origin') || null,
+          referer: req.get('referer') || null,
           userAgent: req.get('user-agent') || null,
           params: req.params,
           query: req.query,
           body: req.body,
+          response: res.locals.imoveResponseBody || null,
           authUserId: req.auth?.user?._id ? String(req.auth.user._id) : null,
+          adminUserId: req.admin?._id ? String(req.admin._id) : null,
         });
     } else if (String(process.env.LOG_HTTP_SUCCESS || 'false').toLowerCase() === 'true') {
-      diagnosticLog('INFO', 'HTTP', `${req.method} ${req.originalUrl} -> ${res.statusCode} (${elapsedMs}ms)`, { requestId });
+      diagnosticLog('INFO', 'HTTP', `${req.method} ${req.originalUrl} -> ${res.statusCode} (${elapsedMs}ms)`, {
+        requestId,
+        origin: req.get('origin') || null,
+      });
     }
   });
   next();
@@ -212,43 +258,79 @@ function maskedMongoUri() {
 // separately and must not make Admin think the whole backend is offline.
 function normalizeCoreHealth(health = {}) {
   const components = { ...(health.components || {}) };
+  const requiredNames = ['api', 'mongodb', 'matching', 'dispatch', 'socket'];
+  const requiredFailures = [];
 
-  if (components.fcm) {
-    components.fcm = {
-      ...components.fcm,
-      required: Boolean(components.fcm.required),
-    };
+  for (const name of requiredNames) {
+    if (components[name]?.ok !== true) requiredFailures.push(name);
+  }
+  for (const name of ['redis', 'fcm']) {
+    if (components[name]?.required === true && components[name]?.ok !== true) requiredFailures.push(name);
   }
 
-  if (components.redis) {
-    components.redis = {
-      ...components.redis,
-      required: Boolean(components.redis.required),
-    };
-  }
-
-  const requiredChecks = [
-    components.api?.ok === true,
-    components.mongodb?.ok === true,
-    components.matching?.ok === true,
-    components.dispatch?.ok === true,
-    components.socket?.ok === true,
-    !components.redis?.required || components.redis?.ok === true,
-    !components.fcm?.required || components.fcm?.ok === true,
-  ];
-
-  const coreReady = requiredChecks.every(Boolean);
-  const warnings = [];
-  if (components.fcm && components.fcm.ok !== true) warnings.push('FCM_NOT_CONFIGURED');
-  if (components.redis && components.redis.required !== true && components.redis.ok !== true) warnings.push('REDIS_NOT_CONFIGURED');
+  const coreReady = requiredFailures.length === 0;
+  const warnings = Array.isArray(health.warnings) ? [...health.warnings] : [];
+  if (components.fcm && components.fcm.configured === false && !warnings.includes('FCM_NOT_CONFIGURED')) warnings.push('FCM_NOT_CONFIGURED');
+  if (components.redis && components.redis.configured === false && !warnings.includes('REDIS_NOT_CONFIGURED')) warnings.push('REDIS_NOT_CONFIGURED');
 
   return {
     ...health,
     components,
     ok: coreReady,
     ready: coreReady,
+    backend: true,
+    database: components.mongodb?.ok === true,
+    requiredFailures,
     warnings,
   };
+}
+
+async function buildPublicHealthPayload() {
+  try {
+    const rawHealth = await productionService.systemHealth();
+    const health = normalizeCoreHealth(rawHealth);
+    mongoConnected = Boolean(health.components?.mongodb?.ok);
+    return {
+      ...health,
+      success: health.ready,
+      ok: health.ready,
+      ready: health.ready,
+      backend: true,
+      coreBackend: true,
+      service: 'TH79_IMOVE_CORE',
+      name: 'TH79 iMove API',
+      version: APP_VERSION,
+      database: mongoConnected,
+      databaseName: DB_NAME,
+      mongoConfigured: Boolean(MONGODB_URI),
+      lastMongoError,
+      environment: NODE_ENV,
+      publicUrl: String(process.env.CORE_PUBLIC_URL || '').trim() || null,
+      diagnostics: {
+        envFilePresent: ENV_INSPECTION.exists,
+        duplicateEnvKeys: ENV_INSPECTION.duplicates,
+        requestLogging: true,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      ok: false,
+      ready: false,
+      backend: true,
+      coreBackend: true,
+      service: 'TH79_IMOVE_CORE',
+      name: 'TH79 iMove API',
+      version: APP_VERSION,
+      database: false,
+      databaseName: DB_NAME,
+      mongoConfigured: Boolean(MONGODB_URI),
+      lastMongoError: lastMongoError || error.message,
+      environment: NODE_ENV,
+      error: { code: error.code || 'HEALTH_CHECK_FAILED', message: error.message },
+      generatedAt: new Date(),
+    };
+  }
 }
 
 async function ensureCustomer({ phone, fullName, email }) {
@@ -481,60 +563,50 @@ app.get('/live', (_req, res) => {
   });
 });
 
-// Health: endpoint ổn định cho Admin Gateway/Nginx. HTTP 200 khi MongoDB sẵn sàng.
-app.get('/health', async (_req, res) => {
-  try {
-    const rawHealth = await productionService.systemHealth();
-    const health = normalizeCoreHealth(rawHealth);
-    mongoConnected = Boolean(health?.components?.mongodb?.ok);
-    const payload = {
-      ...health,
-      ok: mongoConnected,
-      ready: Boolean(health?.ready),
-      backend: true,
-      service: 'TH79_IMOVE_CORE',
-      name: 'TH79 iMove API',
-      version: APP_VERSION,
-      database: mongoConnected,
-      databaseName: DB_NAME,
-      mongoConfigured: Boolean(MONGODB_URI),
-      lastMongoError,
-    };
-    if (!PRODUCTION) payload.mongoUri = maskedMongoUri();
-    return res.status(mongoConnected ? 200 : 503).json(payload);
-  } catch (error) {
-    return res.status(503).json({
-      ok: false,
-      ready: false,
-      backend: true,
-      service: 'TH79_IMOVE_CORE',
-      name: 'TH79 iMove API',
-      version: APP_VERSION,
-      message: error.message,
+// Public health endpoints used by Nginx, Vercel Admin and legacy Admin builds.
+// Keep these endpoints UNAUTHENTICATED so the login screen can verify Core Backend
+// before an admin access token exists.
+const PUBLIC_HEALTH_PATHS = [
+  '/health',
+  '/api/health',
+  '/api/core/health',
+  '/api/admin/health',
+  '/api/v73/health',
+  '/api/v73/admin/health',
+];
+app.get(PUBLIC_HEALTH_PATHS, async (req, res) => {
+  const payload = await buildPublicHealthPayload();
+  const status = payload.database ? 200 : 503;
+  if (status >= 500) {
+    diagnosticLog('ERROR', 'CORE_HEALTH', `Core health failed -> ${status}`, {
+      requestId: req.requestId || null,
+      requiredFailures: payload.requiredFailures || [],
+      lastMongoError: payload.lastMongoError || null,
     });
   }
+  return res.status(status).json(payload);
 });
 
-// Readiness: dùng cho kiểm tra toàn bộ dependency được cấu hình là bắt buộc.
-app.get('/ready', async (_req, res) => {
-  try {
-    const rawHealth = await productionService.systemHealth();
-    const health = normalizeCoreHealth(rawHealth);
-    return res.status(health.ready ? 200 : 503).json({
-      ok: health.ready,
-      ready: health.ready,
-      backend: true,
-      service: 'TH79_IMOVE_CORE',
-      version: APP_VERSION,
-      components: health.components,
-      warnings: health.warnings,
-      generatedAt: health.generatedAt,
-    });
-  } catch (error) {
-    return res.status(503).json({ ok: false, backend: true, service: 'TH79_IMOVE_CORE', version: APP_VERSION, message: error.message });
-  }
+// Lighter readiness result for infrastructure. Optional integrations do not fail
+// readiness unless explicitly configured as required.
+app.get('/ready', async (req, res) => {
+  const payload = await buildPublicHealthPayload();
+  return res.status(payload.ready ? 200 : 503).json({
+    success: payload.ready,
+    ok: payload.ready,
+    ready: payload.ready,
+    backend: true,
+    coreBackend: true,
+    service: payload.service,
+    version: payload.version,
+    environment: payload.environment,
+    components: payload.components,
+    warnings: payload.warnings,
+    requiredFailures: payload.requiredFailures,
+    requestId: req.requestId || null,
+    generatedAt: payload.generatedAt || new Date(),
+  });
 });
-
 
 app.get('/api/network/info', (_req, res) => {
   res.json({
@@ -579,7 +651,12 @@ const {
   requireCancelParticipant,
 } = createBookingSecurity({ getDb: () => db });
 app.use('/api/kyc', createKycRouter({ getDb: () => db }));
-app.use('/api/admin-auth', createAdminAuthRouter({ getDb: () => db }));
+const adminAuthRouter = createAdminAuthRouter({ getDb: () => db });
+app.use('/api/admin-auth', adminAuthRouter);
+// Compatibility aliases for older/newer Admin builds. These keep login public;
+// protected /api/v73/admin/* routes continue to the production admin router.
+app.use('/api/v73/admin-auth', adminAuthRouter);
+app.use('/api/v73/admin', adminAuthRouter);
 app.use('/api/v7/admin', createAdminOpsRouter({ getDb: () => db }));
 app.use('/api/v8/admin/matching', createMatchingAdminRouter({ getDb: () => db, getMatching: () => matching }));
 platformService = createPlatformService({
@@ -1621,6 +1698,8 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`Public URL       : ${String(process.env.CORE_PUBLIC_URL || '(chưa cấu hình)').trim()}`);
   console.log(`Database         : ${DB_NAME}`);
   console.log(`Mongo configured : ${MONGODB_URI ? 'YES' : 'NO'}`);
+  console.log(`CORS origins     : ${String(process.env.CORS_ORIGINS || '(chưa cấu hình)').trim()}`);
+  console.log(`ENV duplicates   : ${ENV_INSPECTION.duplicates.length ? ENV_INSPECTION.duplicates.join(', ') : 'NONE'}`);
 
   const discoveryPort = Number(process.env.LAN_DISCOVERY_PORT || 5051);
   if (LAN_DISCOVERY_ENABLED) {

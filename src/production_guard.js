@@ -40,15 +40,18 @@ function assertProductionConfig() {
     errors.push('MONGODB_URI production chưa hợp lệ');
   }
 
+  const redisRequired = bool('REDIS_REQUIRED', false);
   const redisUrl = String(process.env.REDIS_URL || '').trim();
-  if (!redisUrl) errors.push('REDIS_URL production chưa được cấu hình');
-  if (!bool('REDIS_REQUIRED', true)) errors.push('REDIS_REQUIRED production phải là true');
+  if (redisRequired && !redisUrl) errors.push('REDIS_URL bắt buộc khi REDIS_REQUIRED=true');
   if (!bool('FORCE_HTTPS', true)) errors.push('FORCE_HTTPS production phải là true');
 
   const origins = csv('CORS_ORIGINS');
   if (!origins.length) errors.push('CORS_ORIGINS production chưa được cấu hình');
   if (origins.some((x) => x === '*' || x.startsWith('http://'))) {
     errors.push('CORS_ORIGINS production không được dùng * hoặc HTTP');
+  }
+  if (origins.some((x) => x.includes('*') && !/^https:\/\/\*\.[A-Za-z0-9.-]+$/.test(x))) {
+    errors.push('CORS wildcard chỉ hỗ trợ dạng https://*.example.com');
   }
 
   if (errors.length) {
@@ -62,13 +65,33 @@ function assertProductionConfig() {
 function buildCorsOptions() {
   const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
   if (!production) return { origin: true, credentials: true };
-  const allowed = new Set(csv('CORS_ORIGINS'));
+  const configured = csv('CORS_ORIGINS');
+  const allowed = new Set(configured.filter((x) => !x.includes('*')));
+  const wildcardHosts = configured
+    .filter((x) => /^https:\/\/\*\.[A-Za-z0-9.-]+$/.test(x))
+    .map((x) => x.slice('https://*.'.length).toLowerCase());
+
+  function originAllowed(origin) {
+    if (!origin) return true; // Native apps/server-to-server.
+    if (allowed.has(origin)) return true;
+    try {
+      const url = new URL(origin);
+      if (url.protocol !== 'https:') return false;
+      const host = url.hostname.toLowerCase();
+      return wildcardHosts.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+    } catch (_) {
+      return false;
+    }
+  }
+
   return {
     credentials: true,
     origin(origin, callback) {
-      // Native apps and server-to-server calls normally have no Origin header.
-      if (!origin || allowed.has(origin)) return callback(null, true);
-      return callback(new Error('CORS origin không được phép.'));
+      if (originAllowed(origin)) return callback(null, true);
+      const error = new Error(`CORS origin không được phép: ${origin || '(none)'}`);
+      error.code = 'CORS_ORIGIN_DENIED';
+      error.status = 403;
+      return callback(error);
     },
   };
 }

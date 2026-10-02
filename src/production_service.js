@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { version: PACKAGE_VERSION } = require('../package.json');
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -291,23 +292,53 @@ function createProductionService({ getDb, getMongoConnected, getNotifications, g
     const avgLatency = metrics.requests ? metrics.totalLatencyMs / metrics.requests : 0;
     const errorRate = metrics.requests ? (metrics.errors / metrics.requests) * 100 : 0;
     const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
-    const redisRequired = boolEnv('REDIS_REQUIRED', production);
+    // Redis/FCM are optional unless explicitly marked required. A missing optional
+    // integration must never make the Admin conclude that Core Backend is offline.
+    const redisRequired = boolEnv('REDIS_REQUIRED', false);
+    const fcmRequired = boolEnv('FCM_REQUIRED', false);
+    const fcmConfigured = Boolean(getNotifications?.()?.isConfigured?.());
+    const matchingReady = Boolean(getMatching?.());
+    const dispatchReady = Boolean(getDispatch?.());
+    const socketReady = matchingReady && sockets !== undefined;
     const components = {
-      api: { status: 'ONLINE', ok: true },
-      mongodb: { status: mongo ? 'ONLINE' : 'OFFLINE', ok: mongo, latencyMs: mongoLatencyMs },
-      redis: { status: redis ? 'ONLINE' : redisStatus, ok: redis || !redisRequired, required: redisRequired, error: redisError },
-      fcm: { status: getNotifications?.()?.isConfigured?.() ? 'ONLINE' : 'NOT_CONFIGURED', ok: Boolean(getNotifications?.()?.isConfigured?.()) },
-      matching: { status: getMatching?.() ? 'ONLINE' : 'OFFLINE', ok: Boolean(getMatching?.()) },
-      dispatch: { status: getDispatch?.() ? 'ONLINE' : 'OFFLINE', ok: Boolean(getDispatch?.()) },
-      socket: { status: 'ONLINE', ok: true, connections: sockets },
+      api: { status: 'ONLINE', ok: true, required: true },
+      mongodb: { status: mongo ? 'ONLINE' : 'OFFLINE', ok: mongo, required: true, latencyMs: mongoLatencyMs },
+      redis: {
+        status: redis ? 'ONLINE' : redisStatus,
+        ok: redis || !redisRequired,
+        configured: Boolean(String(process.env.REDIS_URL || '').trim()),
+        required: redisRequired,
+        error: redisError,
+      },
+      fcm: {
+        status: fcmConfigured ? 'ONLINE' : 'NOT_CONFIGURED',
+        ok: fcmConfigured || !fcmRequired,
+        configured: fcmConfigured,
+        required: fcmRequired,
+      },
+      matching: { status: matchingReady ? 'ONLINE' : 'OFFLINE', ok: matchingReady, required: true },
+      dispatch: { status: dispatchReady ? 'ONLINE' : 'OFFLINE', ok: dispatchReady, required: true },
+      socket: { status: socketReady ? 'ONLINE' : 'OFFLINE', ok: socketReady, required: true, connections: sockets ?? 0 },
     };
+    const requiredFailures = Object.entries(components)
+      .filter(([, item]) => item.required === true && item.ok !== true)
+      .map(([name]) => name);
+    const warnings = [];
+    if (!fcmConfigured && !fcmRequired) warnings.push('FCM_NOT_CONFIGURED');
+    if (!redis && !redisRequired) warnings.push('REDIS_NOT_CONFIGURED');
+    const ready = requiredFailures.length === 0;
     return {
-      ok: Object.values(components).every((x) => x.ok),
+      ok: ready,
+      ready,
+      backend: true,
+      database: mongo,
       service: 'TH79_IMOVE_CORE',
-      version: '1.4.0',
+      version: String(process.env.APP_VERSION || PACKAGE_VERSION || '1.6.0'),
       environment: process.env.NODE_ENV || 'development',
       uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
       components,
+      warnings,
+      requiredFailures,
       metrics: {
         requests: metrics.requests,
         errors: metrics.errors,
