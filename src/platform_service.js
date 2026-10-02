@@ -423,6 +423,28 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       if (!existing.has(name)) await db.createCollection(name);
     }
 
+    // v1.7.1 safety migration:
+    // Older builds created a compound UNIQUE + sparse index on
+    // { conversationId, idempotencyKey }. Because conversationId is always
+    // present, MongoDB can still index rows where idempotencyKey is null and
+    // trigger E11000. Replace only that named legacy index; no user data is
+    // changed and no VPS/environment setting is touched.
+    try {
+      const messageIndexes = await db.collection('messages').indexes();
+      const legacy = messageIndexes.find((x) => x?.name === 'uq_message_idempotency');
+      const partial = legacy?.partialFilterExpression?.idempotencyKey;
+      const alreadySafe = Boolean(
+        legacy?.unique === true &&
+        partial?.$exists === true &&
+        partial?.$type === 'string'
+      );
+      if (legacy && !alreadySafe) {
+        await db.collection('messages').dropIndex('uq_message_idempotency');
+      }
+    } catch (error) {
+      if (error?.codeName !== 'IndexNotFound' && error?.code !== 27) throw error;
+    }
+
     await Promise.all([
       db.collection('notifications').createIndex({ userId: 1, createdAt: -1 }, { name: 'idx_notifications_user_created' }),
       db.collection('device_tokens').createIndex({ token: 1 }, { unique: true, name: 'uq_device_token' }),
@@ -466,7 +488,16 @@ function createPlatformService({ getDb, getClient, getMatching }) {
       ),
       db.collection('conversations').createIndex({ participantUserIds: 1, updatedAt: -1 }, { name: 'idx_conversation_participant' }),
       db.collection('messages').createIndex({ conversationId: 1, createdAt: 1 }, { name: 'idx_messages_conversation' }),
-      db.collection('messages').createIndex({ conversationId: 1, idempotencyKey: 1 }, { unique: true, sparse: true, name: 'uq_message_idempotency' }),
+      db.collection('messages').createIndex(
+        { conversationId: 1, idempotencyKey: 1 },
+        {
+          unique: true,
+          partialFilterExpression: {
+            idempotencyKey: { $exists: true, $type: 'string' },
+          },
+          name: 'uq_message_idempotency',
+        },
+      ),
       db.collection('safety_shares').createIndex({ tokenHash: 1 }, { unique: true, name: 'uq_safety_share_token' }),
       db.collection('safety_shares').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0, name: 'ttl_safety_share' }),
     ]);

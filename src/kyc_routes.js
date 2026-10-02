@@ -3,10 +3,10 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { ObjectId } = require('mongodb');
 const { encryptText, last4, maskLast4 } = require('./kyc_crypto');
 const { SERVICE_CODES } = require('./service_catalog_service');
+const { paths: localPaths, randomStoredName, relativeToProject, resolveProjectRelative } = require('./local_storage_service');
 
 const router = express.Router();
 const DOC_TYPES = new Set(['CCCD', 'DRIVER_LICENSE', 'VEHICLE_REGISTRATION', 'CRIMINAL_RECORD']);
@@ -50,7 +50,7 @@ function normalizeServicePreferences(codes, raw = {}) {
 
 const now = () => new Date();
 const projectRoot = path.resolve(__dirname, '..');
-const uploadRoot = path.resolve(projectRoot, String(process.env.KYC_UPLOAD_DIR || 'storage/kyc'));
+const uploadRoot = localPaths.kyc;
 const maxFileMb = Math.max(1, Math.min(20, Number(process.env.KYC_MAX_FILE_MB || 8)));
 fs.mkdirSync(uploadRoot, { recursive: true });
 
@@ -109,9 +109,7 @@ function multerStorage() {
       cb(null, dir);
     },
     filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname || '').toLowerCase();
-      const safeExt = ['.jpg', '.jpeg', '.png', '.webp', '.pdf'].includes(ext) ? ext : '';
-      cb(null, `${Date.now()}_${crypto.randomBytes(8).toString('hex')}${safeExt}`);
+      cb(null, randomStoredName(file, 'kyc'));
     },
   });
 }
@@ -246,7 +244,7 @@ function docStatusKey(type) {
 }
 
 async function saveFileRecord(db, req, file, category, slot, driverId = null) {
-  const relativePath = path.relative(projectRoot, file.path).replace(/\\/g, '/');
+  const relativePath = relativeToProject(file.path);
   const doc = {
     ownerUserId: req.auth.userId,
     driverId: driverId || null,
@@ -612,8 +610,8 @@ function createKycRouter({ getDb }) {
       if (!file) return res.status(404).json({ message: 'Không tìm thấy file.' });
       const isAdmin = req.auth.roles.includes('ADMIN');
       if (!isAdmin && String(file.ownerUserId) !== String(req.auth.userId)) return res.status(403).json({ message: 'Không có quyền xem file này.' });
-      const absolute = path.resolve(projectRoot, file.relativePath);
-      if (!absolute.startsWith(uploadRoot) || !fs.existsSync(absolute)) return res.status(404).json({ message: 'File vật lý không tồn tại.' });
+      const absolute = resolveProjectRelative(file.relativePath, uploadRoot);
+      if (!fs.existsSync(absolute)) return res.status(404).json({ message: 'File vật lý không tồn tại.' });
       res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
       res.setHeader('Cache-Control', 'private, no-store');
       return res.sendFile(absolute);

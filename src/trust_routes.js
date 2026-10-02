@@ -1,13 +1,30 @@
 const express=require('express');
 const multer=require('multer');
+const fs=require('fs');
+const path=require('path');
 const jwt=require('jsonwebtoken');
 const {ObjectId}=require('mongodb');
 const {createAdminGuard}=require('./admin_guard');
+const {paths:localPaths,randomStoredName,removeFileQuiet}=require('./local_storage_service');
 
 function oid(v){try{return new ObjectId(String(v));}catch(_){return null;}}
 function jwtSecret(){const s=String(process.env.JWT_ACCESS_SECRET||'').trim();if(s.length<32)throw new Error('JWT_ACCESS_SECRET chưa an toàn.');return s;}
 function createTrustRouter({getDb,getTrust,getProduction,findDriverByPhone}){
-  const r=express.Router(); const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:5*1024*1024}});
+  const r=express.Router();
+  const incomingDir=path.join(localPaths.faceEvidence,'_incoming');
+  fs.mkdirSync(incomingDir,{recursive:true});
+  const faceMaxMb=Math.max(1,Math.min(10,Number(process.env.FACE_EVIDENCE_MAX_FILE_MB||5)));
+  const upload=multer({
+    storage:multer.diskStorage({
+      destination:(_req,_file,cb)=>cb(null,incomingDir),
+      filename:(_req,file,cb)=>cb(null,randomStoredName(file,'face')),
+    }),
+    limits:{fileSize:faceMaxMb*1024*1024},
+    fileFilter:(_req,file,cb)=>{
+      if(/^image\/(jpeg|png|webp)$/i.test(String(file.mimetype||'')))return cb(null,true);
+      return cb(new Error('Ảnh khuôn mặt chỉ chấp nhận JPEG/PNG/WEBP.'));
+    },
+  });
   async function auth(req,res,next){try{const h=String(req.headers.authorization||'');if(!h.startsWith('Bearer '))return res.status(401).json({message:'Thiếu Access Token.'});const p=jwt.verify(h.slice(7),jwtSecret());const id=oid(p.sub||p.userId);const u=await getDb().collection('users').findOne({_id:id});if(!u)return res.status(401).json({message:'Tài khoản không hợp lệ.'});req.user=u;req.role=Array.isArray(u.roles)&&u.roles.includes('DRIVER')?'DRIVER':'CUSTOMER';next();}catch(_){return res.status(401).json({message:'Phiên đăng nhập không hợp lệ.'});}}
   r.use(auth);
   async function appCheck(req,res,next){
@@ -41,7 +58,17 @@ function createTrustRouter({getDb,getTrust,getProduction,findDriverByPhone}){
   r.get('/risk/me',async(req,res)=>res.json(await getTrust().score(req.user._id,req.role)));
   r.get('/driver/trust/me',async(req,res)=>{if(req.role!=='DRIVER')return res.status(403).json({message:'Chỉ dành cho tài xế.'});const found=await findDriverByPhone(req.user.phone);if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'});return res.json(await getTrust().driverTrustStatus({driver:found.driver,user:req.user}));});
   r.get('/driver/identity/challenge',async(req,res)=>{if(req.role!=='DRIVER')return res.status(403).json({message:'Chỉ dành cho tài xế.'});const found=await findDriverByPhone(req.user.phone);return res.json(await getTrust().createFaceChallenge({userId:req.user._id,driverId:found?.driver?._id,trigger:req.query.trigger||'GO_ONLINE'}));});
-  r.post('/driver/identity/face/complete',upload.single('selfie'),async(req,res)=>{try{if(req.role!=='DRIVER')return res.status(403).json({message:'Chỉ dành cho tài xế.'});const actions=String(req.body?.actionsCompleted||'').split(',').map(x=>x.trim()).filter(Boolean);const value=await getTrust().completeFace({challengeId:req.body?.challengeId,userId:req.user._id,role:'DRIVER',imageBuffer:req.file?.buffer||null,imageMime:req.file?.mimetype||'image/jpeg',deviceId:req.body?.deviceId,actionsCompleted:actions});return res.json(value);}catch(e){return res.status(400).json({message:e.message});}});
+  r.post('/driver/identity/face/complete',upload.single('selfie'),async(req,res)=>{
+    let tempPath=req.file?.path||null;
+    try{
+      if(req.role!=='DRIVER')return res.status(403).json({message:'Chỉ dành cho tài xế.'});
+      const actions=String(req.body?.actionsCompleted||'').split(',').map(x=>x.trim()).filter(Boolean);
+      const imageBuffer=tempPath?await fs.promises.readFile(tempPath):null;
+      const value=await getTrust().completeFace({challengeId:req.body?.challengeId,userId:req.user._id,role:'DRIVER',imageBuffer,imageMime:req.file?.mimetype||'image/jpeg',deviceId:req.body?.deviceId,actionsCompleted:actions});
+      return res.json(value);
+    }catch(e){return res.status(400).json({message:e.message});}
+    finally{if(tempPath)await removeFileQuiet(tempPath,localPaths.faceEvidence);}
+  });
   r.post('/driver/security-heartbeat',async(req,res)=>{try{if(req.role!=='DRIVER')return res.status(403).json({message:'Chỉ dành cho tài xế.'});const found=await findDriverByPhone(req.user.phone);if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'});return res.json(await getTrust().analyzeLocation({driverId:found.driver._id,userId:req.user._id,...req.body}));}catch(e){return res.status(400).json({message:e.message});}});
   return r;
 }

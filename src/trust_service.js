@@ -1,5 +1,8 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { ObjectId } = require('mongodb');
+const { paths: localPaths, relativeToProject, resolveProjectRelative } = require('./local_storage_service');
 
 function bool(v, fallback=false){ if(v==null||v==='')return fallback; return ['1','true','yes','on'].includes(String(v).toLowerCase()); }
 function num(v, fallback=0){ const n=Number(v); return Number.isFinite(n)?n:fallback; }
@@ -21,6 +24,43 @@ function encryptBuffer(buffer){
 }
 function decryptBuffer(payload){
   const key=evidenceKey(); if(!key||!payload)return null; const decipher=crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(payload.iv.buffer||payload.iv)); decipher.setAuthTag(Buffer.from(payload.tag.buffer||payload.tag)); return Buffer.concat([decipher.update(Buffer.from(payload.data.buffer||payload.data)),decipher.final()]);
+}
+
+function encodeEncryptedEvidence(payload){
+  if(!payload)return null;
+  return JSON.stringify({
+    v:payload.v||1,
+    alg:payload.alg||'aes-256-gcm',
+    iv:Buffer.from(payload.iv).toString('base64'),
+    tag:Buffer.from(payload.tag).toString('base64'),
+    data:Buffer.from(payload.data).toString('base64'),
+  });
+}
+function decodeEncryptedEvidence(text){
+  const row=JSON.parse(String(text||''));
+  return {
+    v:Number(row.v||1),
+    alg:String(row.alg||'aes-256-gcm'),
+    iv:Buffer.from(String(row.iv||''),'base64'),
+    tag:Buffer.from(String(row.tag||''),'base64'),
+    data:Buffer.from(String(row.data||''),'base64'),
+  };
+}
+async function storeFaceEvidenceFile(buffer, verificationId){
+  if(!buffer?.length)return null;
+  const encrypted=encryptBuffer(buffer);
+  if(!encrypted)throw new Error('FACE_EVIDENCE_KEY/KYC_DATA_KEY chưa được cấu hình để mã hóa ảnh khuôn mặt.');
+  fs.mkdirSync(localPaths.faceEvidence,{recursive:true});
+  const filename=`face-${String(verificationId)}-${crypto.randomBytes(8).toString('hex')}.imove`;
+  const absolute=path.join(localPaths.faceEvidence,filename);
+  await fs.promises.writeFile(absolute,encodeEncryptedEvidence(encrypted),{mode:0o600});
+  return {relativePath:relativeToProject(absolute),storedName:filename,size:buffer.length};
+}
+async function loadFaceEvidenceFile(relativePath){
+  if(!relativePath)return null;
+  const absolute=resolveProjectRelative(relativePath,localPaths.faceEvidence);
+  const text=await fs.promises.readFile(absolute,'utf8');
+  return decryptBuffer(decodeEncryptedEvidence(text));
 }
 
 const DEFAULT_RULES=[
@@ -140,9 +180,24 @@ function createTrustService({getDb, notificationService=null}){
     }
     const doc={userId:uid,driverId:ch.driverId||null,role:String(role).toUpperCase(),type:'FACE_LIVENESS',trigger:ch.trigger,status,livenessScore,faceMatchScore,actionsExpected:ch.actions,actionsCompleted:Array.isArray(actionsCompleted)?actionsCompleted:[],evidenceHash,deviceId:deviceId||null,providerMode:mode,createdAt:now,updatedAt:now};
     const r=await db.collection('identity_verifications').insertOne(doc);
-    const encryptedEvidence=encryptBuffer(imageBuffer);
-    if(encryptedEvidence){
-      await db.collection('face_evidence').updateOne({verificationId:r.insertedId},{$set:{verificationId:r.insertedId,userId:uid,mimeType:imageMime||'image/jpeg',encrypted:encryptedEvidence,createdAt:now,expiresAt:new Date(Date.now()+30*86400000)}},{upsert:true});
+    const storedEvidence=await storeFaceEvidenceFile(imageBuffer,r.insertedId);
+    if(storedEvidence){
+      const retentionDays=Math.max(1,num(process.env.FACE_EVIDENCE_RETENTION_DAYS,30));
+      await db.collection('face_evidence').updateOne(
+        {verificationId:r.insertedId},
+        {$set:{
+          verificationId:r.insertedId,
+          userId:uid,
+          mimeType:imageMime||'image/jpeg',
+          storage:'PRIVATE_LOCAL_ENCRYPTED',
+          relativePath:storedEvidence.relativePath,
+          storedName:storedEvidence.storedName,
+          size:storedEvidence.size,
+          createdAt:now,
+          expiresAt:new Date(Date.now()+retentionDays*86400000),
+        },$unset:{encrypted:''}},
+        {upsert:true},
+      );
     }
     await db.collection('identity_challenges').updateOne({_id:cid},{$set:{status:'USED',usedAt:now}});
     if(status==='PASSED'){
@@ -261,7 +316,17 @@ function createTrustService({getDb, notificationService=null}){
   }
 
   async function getFaceEvidence(verificationId){
-    const id=oid(verificationId); if(!id)return null; const doc=await getDb().collection('face_evidence').findOne({verificationId:id}); if(!doc)return null; const buffer=decryptBuffer(doc.encrypted); return buffer?{buffer,mimeType:doc.mimeType||'image/jpeg'}:null;
+    const id=oid(verificationId);
+    if(!id)return null;
+    const doc=await getDb().collection('face_evidence').findOne({verificationId:id});
+    if(!doc)return null;
+    let buffer=null;
+    if(doc.relativePath){
+      try{buffer=await loadFaceEvidenceFile(doc.relativePath);}catch(_){buffer=null;}
+    }
+    // Backward compatibility: evidence created before LOCAL storage migration.
+    if(!buffer&&doc.encrypted)buffer=decryptBuffer(doc.encrypted);
+    return buffer?{buffer,mimeType:doc.mimeType||'image/jpeg'}:null;
   }
 
   async function overview(){
