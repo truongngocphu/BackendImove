@@ -81,7 +81,44 @@ app.use((req, res, next) => {
   next();
 });
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-app.use(cors(buildCorsOptions()));
+
+// Admin Web production CORS.
+// This is source-level configuration so Nginx/VPS routing does not need to change.
+// Keep CORS_ORIGINS support, while always allowing the current TH79 iMove Admin origin.
+const configuredCorsOrigins = String(process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+
+const allowedCorsOrigins = new Set([
+  'https://imove.daututh79.com',
+  'https://www.imove.daututh79.com',
+  ...configuredCorsOrigins,
+]);
+
+const adminCorsOptions = {
+  origin(origin, callback) {
+    // Mobile apps, curl, health checks and server-to-server requests may not send Origin.
+    if (!origin) return callback(null, true);
+    if (allowedCorsOrigins.has(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Authorization',
+    'Content-Type',
+    'Accept',
+    'Cache-Control',
+    'Pragma',
+    'X-Requested-With',
+  ],
+  exposedHeaders: ['Content-Disposition', 'Content-Length', 'Content-Type'],
+  maxAge: 86400,
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(adminCorsOptions));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: Math.max(60, Number(process.env.API_RATE_LIMIT_PER_MINUTE || 600)), standardHeaders: 'draft-7', legacyHeaders: false }));
 
