@@ -1,7 +1,17 @@
 function bool(name, defaultValue = false) {
   const raw = process.env[name];
-  if (raw === undefined || raw === null || raw === '') return defaultValue;
-  return String(raw).trim().toLowerCase() === 'true';
+
+  if (
+    raw === undefined ||
+    raw === null ||
+    raw === ''
+  ) {
+    return defaultValue;
+  }
+
+  return String(raw)
+    .trim()
+    .toLowerCase() === 'true';
 }
 
 function csv(name) {
@@ -12,65 +22,295 @@ function csv(name) {
 }
 
 function assertProductionConfig() {
-  const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
-  if (!production) return { production: false };
+  const production =
+    String(
+      process.env.NODE_ENV || 'development',
+    )
+      .trim()
+      .toLowerCase() === 'production';
+
+  if (!production) {
+    return {
+      production: false,
+    };
+  }
 
   const errors = [];
-  if (bool('AUTH_DEV_SHOW_OTP', false)) errors.push('AUTH_DEV_SHOW_OTP phải là false');
-  if (bool('V64_DEMO_TOPUP_ENABLED', false)) errors.push('V64_DEMO_TOPUP_ENABLED phải là false');
-  if (bool('LAN_DISCOVERY_ENABLED', false)) errors.push('LAN_DISCOVERY_ENABLED phải là false');
-  if (bool('MATCHING_ALLOW_NO_GPS_FALLBACK', false)) errors.push('MATCHING_ALLOW_NO_GPS_FALLBACK phải là false');
-  if (bool('SEED_DEMO_ON_START', false)) errors.push('SEED_DEMO_ON_START phải là false');
-  // Firebase App Check is not a required dependency in the MongoDB-first build.
-  // Enable APP_INTEGRITY_REQUIRED only after configuring a non-Firebase provider.
-  if (!bool('TRUST_MATCHING_ENFORCEMENT', true)) errors.push('TRUST_MATCHING_ENFORCEMENT phải là true');
-  const faceMode = String(process.env.FACE_PROVIDER_MODE || 'MANUAL').toUpperCase();
-  if (faceMode === 'DEV') errors.push('FACE_PROVIDER_MODE production không được là DEV');
-  const faceKey = String(process.env.FACE_EVIDENCE_KEY || process.env.KYC_DATA_KEY || '');
-  if (faceKey.length < 32) errors.push('FACE_EVIDENCE_KEY hoặc KYC_DATA_KEY phải >= 32 ký tự để mã hóa face evidence');
 
-  // FCM is optional. Notifications are persisted/delivered in-app through MongoDB.
-  const accessSecret = String(process.env.JWT_ACCESS_SECRET || '');
-  if (accessSecret.length < 32 || /CHANGE_TO|changeme|secret/i.test(accessSecret)) {
-    errors.push('JWT_ACCESS_SECRET phải là secret production >= 32 ký tự');
+  // =====================================================
+  // DEVELOPMENT / DEMO FLAGS
+  // =====================================================
+
+  if (bool('AUTH_DEV_SHOW_OTP', false)) {
+    errors.push(
+      'AUTH_DEV_SHOW_OTP phải là false',
+    );
   }
 
-  const mongoUri = String(process.env.MONGODB_URI || '');
-  if (!/^mongodb(\+srv)?:\/\//i.test(mongoUri) || /USERNAME|PASSWORD|YOUR_/i.test(mongoUri)) {
-    errors.push('MONGODB_URI production chưa hợp lệ');
+  if (bool('V64_DEMO_TOPUP_ENABLED', false)) {
+    errors.push(
+      'V64_DEMO_TOPUP_ENABLED phải là false',
+    );
   }
 
-  const redisUrl = String(process.env.REDIS_URL || '').trim();
-  if (!redisUrl) errors.push('REDIS_URL production chưa được cấu hình');
-  if (!bool('REDIS_REQUIRED', true)) errors.push('REDIS_REQUIRED production phải là true');
-  if (!bool('FORCE_HTTPS', true)) errors.push('FORCE_HTTPS production phải là true');
-
-  const origins = csv('CORS_ORIGINS');
-  if (!origins.length) errors.push('CORS_ORIGINS production chưa được cấu hình');
-  if (origins.some((x) => x === '*' || x.startsWith('http://'))) {
-    errors.push('CORS_ORIGINS production không được dùng * hoặc HTTP');
+  if (bool('LAN_DISCOVERY_ENABLED', false)) {
+    errors.push(
+      'LAN_DISCOVERY_ENABLED phải là false',
+    );
   }
+
+  if (
+    bool(
+      'MATCHING_ALLOW_NO_GPS_FALLBACK',
+      false,
+    )
+  ) {
+    errors.push(
+      'MATCHING_ALLOW_NO_GPS_FALLBACK phải là false',
+    );
+  }
+
+  if (bool('SEED_DEMO_ON_START', false)) {
+    errors.push(
+      'SEED_DEMO_ON_START phải là false',
+    );
+  }
+
+  // =====================================================
+  // TRUST / MATCHING
+  // =====================================================
+
+  if (
+    !bool(
+      'TRUST_MATCHING_ENFORCEMENT',
+      true,
+    )
+  ) {
+    errors.push(
+      'TRUST_MATCHING_ENFORCEMENT phải là true',
+    );
+  }
+
+  // =====================================================
+  // FACE / KYC
+  // =====================================================
+
+  const faceMode = String(
+    process.env.FACE_PROVIDER_MODE ||
+      'MANUAL',
+  )
+    .trim()
+    .toUpperCase();
+
+  if (faceMode === 'DEV') {
+    errors.push(
+      'FACE_PROVIDER_MODE production không được là DEV',
+    );
+  }
+
+  const faceKey = String(
+    process.env.FACE_EVIDENCE_KEY ||
+      process.env.KYC_DATA_KEY ||
+      '',
+  ).trim();
+
+  if (faceKey.length < 32) {
+    errors.push(
+      'FACE_EVIDENCE_KEY hoặc KYC_DATA_KEY phải >= 32 ký tự để mã hóa face evidence',
+    );
+  }
+
+  // =====================================================
+  // JWT
+  // =====================================================
+
+  const accessSecret = String(
+    process.env.JWT_ACCESS_SECRET || '',
+  ).trim();
+
+  if (
+    accessSecret.length < 32 ||
+    /CHANGE_TO|changeme|secret/i.test(
+      accessSecret,
+    )
+  ) {
+    errors.push(
+      'JWT_ACCESS_SECRET phải là secret production >= 32 ký tự',
+    );
+  }
+
+  // =====================================================
+  // MONGODB
+  // =====================================================
+
+  const mongoUri = String(
+    process.env.MONGODB_URI || '',
+  ).trim();
+
+  if (
+    !/^mongodb(?:\+srv)?:\/\//i.test(
+      mongoUri,
+    ) ||
+    /USERNAME|PASSWORD|YOUR_/i.test(
+      mongoUri,
+    )
+  ) {
+    errors.push(
+      'MONGODB_URI production chưa hợp lệ',
+    );
+  }
+
+  // =====================================================
+  // REDIS
+  //
+  // Redis là OPTIONAL.
+  // Chỉ bắt buộc khi REDIS_REQUIRED=true.
+  // =====================================================
+
+  const redisRequired = bool(
+    'REDIS_REQUIRED',
+    false,
+  );
+
+  const redisUrl = String(
+    process.env.REDIS_URL || '',
+  ).trim();
+
+  if (redisRequired && !redisUrl) {
+    errors.push(
+      'REDIS_URL bắt buộc khi REDIS_REQUIRED=true',
+    );
+  }
+
+  // =====================================================
+  // FCM
+  //
+  // FCM có thể tắt.
+  // Nếu FCM_REQUIRED=false thì không chặn Backend.
+  // =====================================================
+
+  const fcmRequired = bool(
+    'FCM_REQUIRED',
+    false,
+  );
+
+  const fcmEnabled = bool(
+    'FCM_ENABLED',
+    false,
+  );
+
+  if (fcmRequired && !fcmEnabled) {
+    errors.push(
+      'FCM_ENABLED phải là true khi FCM_REQUIRED=true',
+    );
+  }
+
+  // =====================================================
+  // HTTPS
+  // =====================================================
+
+  if (!bool('FORCE_HTTPS', true)) {
+    errors.push(
+      'FORCE_HTTPS production phải là true',
+    );
+  }
+
+  // =====================================================
+  // CORS
+  // =====================================================
+
+  const origins = csv(
+    'CORS_ORIGINS',
+  );
+
+  if (!origins.length) {
+    errors.push(
+      'CORS_ORIGINS production chưa được cấu hình',
+    );
+  }
+
+  if (
+    origins.some(
+      (origin) =>
+        origin === '*' ||
+        origin.startsWith('http://'),
+    )
+  ) {
+    errors.push(
+      'CORS_ORIGINS production không được dùng * hoặc HTTP',
+    );
+  }
+
+  // =====================================================
+  // FINAL
+  // =====================================================
 
   if (errors.length) {
-    const error = new Error(`Production guard từ chối khởi động:\n- ${errors.join('\n- ')}`);
-    error.code = 'PRODUCTION_GUARD_FAILED';
+    const error = new Error(
+      `Production guard từ chối khởi động:\n- ${errors.join(
+        '\n- ',
+      )}`,
+    );
+
+    error.code =
+      'PRODUCTION_GUARD_FAILED';
+
     throw error;
   }
-  return { production: true };
+
+  return {
+    production: true,
+    redisRequired,
+    fcmRequired,
+    fcmEnabled,
+  };
 }
 
 function buildCorsOptions() {
-  const production = String(process.env.NODE_ENV || 'development').toLowerCase() === 'production';
-  if (!production) return { origin: true, credentials: true };
-  const allowed = new Set(csv('CORS_ORIGINS'));
+  const production =
+    String(
+      process.env.NODE_ENV || 'development',
+    )
+      .trim()
+      .toLowerCase() === 'production';
+
+  if (!production) {
+    return {
+      origin: true,
+      credentials: true,
+    };
+  }
+
+  const allowed = new Set(
+    csv('CORS_ORIGINS'),
+  );
+
   return {
     credentials: true,
+
     origin(origin, callback) {
-      // Native apps and server-to-server calls normally have no Origin header.
-      if (!origin || allowed.has(origin)) return callback(null, true);
-      return callback(new Error('CORS origin không được phép.'));
+      // Flutter native / server-to-server
+      // thường không có Origin.
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      // Web Admin được phép nếu nằm
+      // trong CORS_ORIGINS.
+      if (allowed.has(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(
+        new Error(
+          `CORS origin không được phép: ${origin}`,
+        ),
+      );
     },
   };
 }
 
-module.exports = { assertProductionConfig, buildCorsOptions };
+module.exports = {
+  assertProductionConfig,
+  buildCorsOptions,
+};
