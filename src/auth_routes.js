@@ -44,10 +44,8 @@ const OTP_MINUTES =
   );
 
 const DEV_SHOW_OTP =
-  String(
-    process.env.AUTH_DEV_SHOW_OTP ||
-    'false',
-  ).toLowerCase() === 'true';
+  String(process.env.AUTH_DEV_SHOW_OTP || 'false').toLowerCase() === 'true' &&
+  String(process.env.NODE_ENV || '').toLowerCase() !== 'production';
 
 const now = () => new Date();
 

@@ -85,7 +85,7 @@ async function sendViaSpeedSms({ phone, message }) {
       to: [normalizeSpeedSmsPhone(phone)],
       content: message,
       sms_type: smsType,
-      sender,
+      ...(sender ? { sender } : {}),
     };
 
     const response = await fetch(url, {

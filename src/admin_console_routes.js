@@ -33,7 +33,7 @@ const DEFAULT_ADMIN_ROLES = [
   ['VIEWER','Chỉ xem',['dashboard.view','users.view','drivers.view','bookings.view','pricing.view','fees.view','payments.view','reports.view','broadcast.view']]
 ];
 
-function createAdminConsoleRouter({ getDb, appVersion = '1.6.1', backendUrl = 'https://backendimove.daututh79.com' } = {}) {
+function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6.1', backendUrl = 'https://backendimove.daututh79.com' } = {}) {
   if (typeof getDb !== 'function') throw new Error('createAdminConsoleRouter yêu cầu getDb().');
   const router = express.Router();
   const APP_VERSION = String(appVersion || '1.6.1');
@@ -321,6 +321,251 @@ function createAdminConsoleRouter({ getDb, appVersion = '1.6.1', backendUrl = 'h
       const actorList=await db().collection('users').find({roles:'ADMIN'}).project({fullName:1,phone:1,email:1,status:1}).sort({fullName:1}).toArray();
       res.json({logs:rows,actors:actorList.map(a=>({id:String(a._id),fullName:a.fullName||'Quản trị viên',phone:a.phone||null,email:a.email||null,status:a.status||'ACTIVE'}))});
     }catch(error){res.status(500).json({message:error.message})}
+  });
+
+  // ============================================================
+  // SUPPORT CHAT CENTER
+  // Admin-side view/reply for SUPPORT conversations created by
+  // User / Driver / Merchant via /api/v6/conversations/support.
+  // ============================================================
+  function supportConversationFilter() {
+    return { type: 'SUPPORT' };
+  }
+
+  function supportMessagePublic(doc) {
+    return {
+      id: String(doc?._id || ''),
+      conversationId: String(doc?.conversationId || ''),
+      senderUserId: doc?.senderUserId ? String(doc.senderUserId) : null,
+      senderRole: String(doc?.senderRole || 'SYSTEM'),
+      type: String(doc?.type || 'TEXT'),
+      text: String(doc?.text || ''),
+      createdAt: doc?.createdAt || null,
+    };
+  }
+
+  async function supportConversationPublic(doc) {
+    const ownerId = objectIdOrNull(doc?.ownerUserId);
+    const owner = ownerId
+      ? await db().collection('users').findOne(
+          { _id: ownerId },
+          { projection: { fullName: 1, phone: 1, email: 1, roles: 1, status: 1 } },
+        )
+      : null;
+    const adminReadAt = doc?.adminReadAt instanceof Date ? doc.adminReadAt : new Date(0);
+    const unread = await db().collection('messages').countDocuments({
+      conversationId: doc._id,
+      senderRole: { $ne: 'ADMIN' },
+      createdAt: { $gt: adminReadAt },
+    });
+    return {
+      id: String(doc._id),
+      type: 'SUPPORT',
+      title: String(doc.title || 'TH79 iMove Support'),
+      status: String(doc.status || 'OPEN').toUpperCase(),
+      ownerUserId: ownerId ? String(ownerId) : null,
+      owner: owner
+        ? {
+            id: String(owner._id),
+            fullName: owner.fullName || 'Người dùng',
+            phone: owner.phone || null,
+            email: owner.email || null,
+            roles: Array.isArray(owner.roles) ? owner.roles : [],
+            status: owner.status || 'ACTIVE',
+          }
+        : null,
+      assignedAdminId: doc.assignedAdminId ? String(doc.assignedAdminId) : null,
+      lastMessage: String(doc.lastMessage || ''),
+      lastMessageAt: doc.lastMessageAt || null,
+      unread,
+      createdAt: doc.createdAt || null,
+      updatedAt: doc.updatedAt || null,
+    };
+  }
+
+  router.get('/api/admin-support/summary', requireAdminAccess('support.view'), async (_req, res) => {
+    try {
+      const conversations = db().collection('conversations');
+      const messages = db().collection('messages');
+      const [open, closed, unreadRows] = await Promise.all([
+        conversations.countDocuments({ ...supportConversationFilter(), status: { $ne: 'CLOSED' } }),
+        conversations.countDocuments({ ...supportConversationFilter(), status: 'CLOSED' }),
+        messages.aggregate([
+          { $match: { senderRole: { $ne: 'ADMIN' } } },
+          { $lookup: { from: 'conversations', localField: 'conversationId', foreignField: '_id', as: 'conversation' } },
+          { $unwind: '$conversation' },
+          { $match: { 'conversation.type': 'SUPPORT' } },
+          { $match: { $expr: { $gt: ['$createdAt', { $ifNull: ['$conversation.adminReadAt', new Date(0)] }] } } },
+          { $count: 'count' },
+        ]).toArray(),
+      ]);
+      res.json({ open, closed, total: open + closed, unread: Number(unreadRows?.[0]?.count || 0) });
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  router.get('/api/admin-support/conversations', requireAdminAccess('support.view'), async (req, res) => {
+    try {
+      const limit = Math.min(150, Math.max(1, Number(req.query.limit || 100)));
+      const status = String(req.query.status || 'ALL').trim().toUpperCase();
+      const query = String(req.query.q || '').trim().toLowerCase();
+      const filter = supportConversationFilter();
+      if (status !== 'ALL') filter.status = status;
+      const docs = await db().collection('conversations')
+        .find(filter)
+        .sort({ updatedAt: -1, _id: -1 })
+        .limit(limit)
+        .toArray();
+      if (!docs.length) return res.json([]);
+
+      const ids = docs.map((x) => x._id);
+      const ownerIds = [...new Set(docs.map((x) => String(x.ownerUserId || '')).filter(Boolean))]
+        .map(objectIdOrNull).filter(Boolean);
+      const [owners, unreadRows] = await Promise.all([
+        ownerIds.length
+          ? db().collection('users').find({ _id: { $in: ownerIds } }, { projection: { fullName: 1, phone: 1, email: 1, roles: 1, status: 1 } }).toArray()
+          : [],
+        db().collection('messages').aggregate([
+          { $match: { conversationId: { $in: ids }, senderRole: { $ne: 'ADMIN' } } },
+          { $lookup: { from: 'conversations', localField: 'conversationId', foreignField: '_id', as: 'conversation' } },
+          { $unwind: '$conversation' },
+          { $match: { $expr: { $gt: ['$createdAt', { $ifNull: ['$conversation.adminReadAt', new Date(0)] }] } } },
+          { $group: { _id: '$conversationId', count: { $sum: 1 } } },
+        ]).toArray(),
+      ]);
+      const ownerMap = new Map(owners.map((x) => [String(x._id), x]));
+      const unreadMap = new Map(unreadRows.map((x) => [String(x._id), Number(x.count || 0)]));
+      const rows = docs.map((doc) => {
+        const owner = ownerMap.get(String(doc.ownerUserId || '')) || null;
+        return {
+          id: String(doc._id),
+          type: 'SUPPORT',
+          title: String(doc.title || 'TH79 iMove Support'),
+          status: String(doc.status || 'OPEN').toUpperCase(),
+          ownerUserId: doc.ownerUserId ? String(doc.ownerUserId) : null,
+          owner: owner ? {
+            id: String(owner._id), fullName: owner.fullName || 'Người dùng', phone: owner.phone || null,
+            email: owner.email || null, roles: Array.isArray(owner.roles) ? owner.roles : [], status: owner.status || 'ACTIVE',
+          } : null,
+          assignedAdminId: doc.assignedAdminId ? String(doc.assignedAdminId) : null,
+          lastMessage: String(doc.lastMessage || ''), lastMessageAt: doc.lastMessageAt || null,
+          unread: unreadMap.get(String(doc._id)) || 0,
+          createdAt: doc.createdAt || null, updatedAt: doc.updatedAt || null,
+        };
+      });
+      const filtered = query
+        ? rows.filter((row) => [row.title, row.lastMessage, row.owner?.fullName, row.owner?.phone, row.owner?.email, ...(row.owner?.roles || [])].join(' ').toLowerCase().includes(query))
+        : rows;
+      res.json(filtered);
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  router.get('/api/admin-support/conversations/:id/messages', requireAdminAccess('support.view'), async (req, res) => {
+    try {
+      const id = objectIdOrNull(req.params.id);
+      if (!id) return res.status(400).json({ message: 'Conversation id không hợp lệ.' });
+      const conversation = await db().collection('conversations').findOne({ _id: id, ...supportConversationFilter() });
+      if (!conversation) return res.status(404).json({ message: 'Không tìm thấy cuộc trò chuyện hỗ trợ.' });
+      const items = await db().collection('messages')
+        .find({ conversationId: id })
+        .sort({ createdAt: 1 })
+        .limit(500)
+        .toArray();
+      await db().collection('conversations').updateOne(
+        { _id: id },
+        { $set: { adminReadAt: new Date() } },
+      );
+      res.json({
+        conversation: await supportConversationPublic({ ...conversation, adminReadAt: new Date() }),
+        messages: items.map(supportMessagePublic),
+      });
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  router.post('/api/admin-support/conversations/:id/messages', requireAdminAccess('support.reply'), async (req, res) => {
+    try {
+      const id = objectIdOrNull(req.params.id);
+      if (!id) return res.status(400).json({ message: 'Conversation id không hợp lệ.' });
+      const conversations = db().collection('conversations');
+      const conversation = await conversations.findOne({ _id: id, ...supportConversationFilter() });
+      if (!conversation) return res.status(404).json({ message: 'Không tìm thấy cuộc trò chuyện hỗ trợ.' });
+      if (String(conversation.status || 'OPEN').toUpperCase() === 'CLOSED') {
+        return res.status(409).json({ message: 'Cuộc trò chuyện đã đóng. Hãy mở lại trước khi phản hồi.' });
+      }
+      const text = String(req.body?.text || '').trim().slice(0, 2000);
+      if (!text) return res.status(400).json({ message: 'Tin nhắn không được để trống.' });
+      const createdAt = new Date();
+      const adminId = objectIdOrNull(req.adminAccess?.user?.id);
+      const doc = {
+        conversationId: id,
+        senderUserId: adminId,
+        senderRole: 'ADMIN',
+        type: 'TEXT',
+        text,
+        createdAt,
+      };
+      const result = await db().collection('messages').insertOne(doc);
+      doc._id = result.insertedId;
+      await conversations.updateOne(
+        { _id: id },
+        {
+          $set: {
+            status: 'OPEN',
+            assignedAdminId: adminId,
+            lastMessage: text,
+            lastMessageAt: createdAt,
+            adminReadAt: createdAt,
+            updatedAt: createdAt,
+          },
+        },
+      );
+      const ownerId = objectIdOrNull(conversation.ownerUserId);
+      const payload = supportMessagePublic(doc);
+      if (ownerId && typeof getMatching === 'function') {
+        try { getMatching()?.emitToUser?.(String(ownerId), 'chat:new_message', payload); } catch (_) {}
+      }
+      await auditAdmin(req, 'SUPPORT_REPLY', 'SUPPORT_CONVERSATION', id, null, { text });
+      res.status(201).json(payload);
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  router.patch('/api/admin-support/conversations/:id', requireAnyAdminAccess(['support.assign', 'support.close']), async (req, res) => {
+    try {
+      const id = objectIdOrNull(req.params.id);
+      if (!id) return res.status(400).json({ message: 'Conversation id không hợp lệ.' });
+      const conversation = await db().collection('conversations').findOne({ _id: id, ...supportConversationFilter() });
+      if (!conversation) return res.status(404).json({ message: 'Không tìm thấy cuộc trò chuyện hỗ trợ.' });
+      const update = { updatedAt: new Date() };
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, 'assignedToMe')) {
+        if (!req.adminAccess.permissions.includes('support.assign')) {
+          return res.status(403).json({ message: 'Bạn không có quyền nhận cuộc trò chuyện.' });
+        }
+        update.assignedAdminId = req.body.assignedToMe ? objectIdOrNull(req.adminAccess?.user?.id) : null;
+      }
+      if (req.body?.status) {
+        if (!req.adminAccess.permissions.includes('support.close')) {
+          return res.status(403).json({ message: 'Bạn không có quyền thay đổi trạng thái hỗ trợ.' });
+        }
+        const next = String(req.body.status).toUpperCase();
+        if (!['OPEN', 'CLOSED'].includes(next)) return res.status(400).json({ message: 'Trạng thái hỗ trợ không hợp lệ.' });
+        update.status = next;
+        if (next === 'CLOSED') update.closedAt = new Date();
+        else update.closedAt = null;
+      }
+      await db().collection('conversations').updateOne({ _id: id }, { $set: update });
+      await auditAdmin(req, 'SUPPORT_UPDATE', 'SUPPORT_CONVERSATION', id, conversation, update);
+      const after = await db().collection('conversations').findOne({ _id: id });
+      res.json(await supportConversationPublic(after));
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
   });
 
   // ============================================================

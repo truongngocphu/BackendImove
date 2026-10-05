@@ -27,19 +27,6 @@ function normalizeDriverTripHistory(rows = []) {
     );
     const fee = platformFeeVnd(row);
     const feePoints = platformFeePoints(row);
-    // Prefer the immutable driver-net snapshot written at booking/completion time.
-    // Older rows may not have customerTotal, so calculating customerTotal-fee alone
-    // incorrectly showed 0 income in Driver history.
-    const driverNetSnapshot = n(
-      row.fareSnapshot?.driverNetAmount ??
-      row.pricing?.driverNetAmount ??
-      row.fareSnapshot?.driverEarningAmount ??
-      row.pricing?.driverEarningAmount,
-      NaN,
-    );
-    const driverNetExpected = Number.isFinite(driverNetSnapshot)
-      ? Math.max(0, driverNetSnapshot)
-      : Math.max(0, customerTotal - fee);
     return {
       id: String(row._id || row.id || ''),
       code: row.bookingCode || row.code || '',
@@ -51,7 +38,7 @@ function normalizeDriverTripHistory(rows = []) {
       cashCollected: paymentMethod(row) === 'CASH' ? customerTotal : 0,
       platformFee: fee,
       platformFeePoints: feePoints,
-      driverNetExpected,
+      driverNetExpected: Math.max(0, customerTotal - fee),
       postedAmount: n(
         row.settlementV140?.driverEarning?.amount ??
         row.settlementV133?.driverEarning?.amount,
@@ -64,19 +51,10 @@ function normalizeDriverTripHistory(rows = []) {
   });
 }
 function summarizeDriverEarnings(rows = []) {
-  // /earnings already queries COMPLETED bookings, but accepting rows without a
-  // status keeps this helper compatible with normalized/legacy callers.
-  const completed = rows.filter((x) => !x.status || String(x.status).toUpperCase() === 'COMPLETED');
+  const completed = rows.filter((x) => x.status === 'COMPLETED');
   const cashCollected = completed.reduce((s, x) => s + n(x.cashCollected), 0);
   const platformFee = completed.reduce((s, x) => s + n(x.platformFee), 0);
   const platformFeePointsTotal = completed.reduce((s, x) => s + n(x.platformFeePoints), 0);
-  const expectedNet = completed.reduce((s, x) => s + n(x.driverNetExpected), 0);
-  const postedAmount = completed.reduce((s, x) => s + n(x.postedAmount), 0);
-  const pendingAmount = completed.reduce((s, x) => {
-    const expected = Math.max(0, n(x.driverNetExpected));
-    const posted = Math.max(0, n(x.postedAmount));
-    return s + Math.max(0, expected - posted);
-  }, 0);
   const netAfterPlatformFee = Math.max(0, cashCollected - platformFee);
   return {
     cashCollected,
@@ -84,9 +62,10 @@ function summarizeDriverEarnings(rows = []) {
     platformFeePoints: platformFeePointsTotal,
     netAfterPlatformFee,
     completedTrips: completed.length,
-    expectedNet,
-    postedAmount,
-    pendingAmount,
+    // compatibility fields for older clients
+    expectedNet: completed.reduce((s, x) => s + n(x.driverNetExpected), 0),
+    postedAmount: completed.reduce((s, x) => s + n(x.postedAmount), 0),
+    pendingAmount: 0,
   };
 }
 module.exports = {

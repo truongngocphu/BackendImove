@@ -1,8 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
-const fs = require('fs');
-const path = require('path');
 require('dotenv').config();
 
 const { calculateFare } = require('./fare_engine');
@@ -51,8 +49,6 @@ const MONGODB_URI = String(process.env.MONGODB_URI || '').trim();
 const DB_NAME = String(process.env.MONGODB_DB || 'th79_imove').trim();
 const RETRY_MS = Math.max(3000, Number(process.env.MONGO_RETRY_SECONDS || 5) * 1000);
 const DEFAULT_BOOKING_TIMEOUT_SECONDS = Math.max(60, Number(process.env.BOOKING_SEARCH_TIMEOUT_SECONDS || 300));
-const DRIVER_PRESENCE_FRESH_MS = Math.max(30000, Number(process.env.DRIVER_PRESENCE_FRESH_MS || 90000));
-const DRIVER_PRESENCE_SWEEP_MS = Math.max(15000, Number(process.env.DRIVER_PRESENCE_SWEEP_MS || 30000));
 const DEMO_RUNTIME_ENABLED = !PRODUCTION &&
   String(process.env.SEED_DEMO_ON_START || 'false').toLowerCase() === 'true';
 const DB_REPAIR_ON_START = String(
@@ -65,123 +61,10 @@ const SERVICE_REGISTRY_ENABLED = String(
   process.env.SERVICE_REGISTRY_ENABLED ?? (PRODUCTION ? 'false' : 'true'),
 ).toLowerCase() === 'true';
 
-function inspectEnvFile() {
-  const envPath = path.resolve(process.cwd(), '.env');
-  if (!fs.existsSync(envPath)) return { exists: false, duplicates: [] };
-  try {
-    const text = fs.readFileSync(envPath, 'utf8');
-    const seen = new Map();
-    const duplicates = [];
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=/);
-      if (!match) continue;
-      const key = match[1];
-      const count = (seen.get(key) || 0) + 1;
-      seen.set(key, count);
-      if (count === 2) duplicates.push(key);
-    }
-    return { exists: true, duplicates };
-  } catch (error) {
-    return { exists: true, duplicates: [], error: error.message };
-  }
-}
-
-const ENV_INSPECTION = inspectEnvFile();
-if (ENV_INSPECTION.duplicates.length) {
-  console.warn(`[ENV] Cảnh báo: .env có biến khai báo lặp: ${ENV_INSPECTION.duplicates.join(', ')}. Giá trị cuối cùng có thể ghi đè giá trị trước.`);
-}
-if (ENV_INSPECTION.error) console.warn('[ENV] Không thể kiểm tra .env:', ENV_INSPECTION.error);
-
 assertProductionConfig();
 
 const app = express();
 app.set('trust proxy', 1);
-
-// Centralized diagnostic logging for easier production debugging.
-// Sensitive values are masked before printing.
-function redactForLog(value, depth = 0) {
-  if (depth > 4) return '[MAX_DEPTH]';
-  if (value == null) return value;
-  if (value instanceof Error) {
-    return { name: value.name, message: value.message, code: value.code || null, stack: value.stack || null };
-  }
-  if (Array.isArray(value)) return value.slice(0, 20).map((item) => redactForLog(item, depth + 1));
-  if (value && typeof value.toHexString === 'function') { try { return value.toHexString(); } catch (_) {} }
-  if (Buffer.isBuffer(value)) return `[Buffer ${value.length} bytes]`;
-  if (typeof value !== 'object') return value;
-  const blocked = /password|pass|token|authorization|cookie|secret|private.?key|mongo.*uri|api.?key|credential/i;
-  const out = {};
-  for (const [key, item] of Object.entries(value)) {
-    out[key] = blocked.test(key) ? '[REDACTED]' : redactForLog(item, depth + 1);
-  }
-  return out;
-}
-
-function diagnosticLog(level, scope, message, context = null) {
-  const payload = {
-    time: new Date().toISOString(),
-    level,
-    scope,
-    message: String(message || ''),
-    ...(context ? { context: redactForLog(context) } : {}),
-  };
-  const line = `[${payload.time}] [${level}] [${scope}] ${payload.message}`;
-  const details = context ? `\n${JSON.stringify(payload.context, null, 2)}` : '';
-  if (level === 'ERROR') console.error(line + details);
-  else if (level === 'WARN') console.warn(line + details);
-  else console.log(line + details);
-}
-
-function logError(scope, error, context = null) {
-  diagnosticLog('ERROR', scope, error?.message || error || 'Unknown error', {
-    ...(context || {}),
-    error: error instanceof Error ? error : { value: error },
-  });
-}
-
-let requestSequence = 0;
-app.use((req, res, next) => {
-  const requestId = `${Date.now().toString(36)}-${(++requestSequence).toString(36)}`;
-  const startedAt = Date.now();
-  req.requestId = requestId;
-  res.setHeader('X-Request-Id', requestId);
-
-  // Capture JSON responses so PM2 logs show the actual reason returned to the app.
-  // redactForLog() masks passwords, access tokens, cookies and secrets.
-  const originalJson = res.json.bind(res);
-  res.json = (body) => {
-    res.locals.imoveResponseBody = redactForLog(body);
-    return originalJson(body);
-  };
-
-  res.on('finish', () => {
-    const elapsedMs = Date.now() - startedAt;
-    if (res.statusCode >= 400) {
-      diagnosticLog(res.statusCode >= 500 ? 'ERROR' : 'WARN', 'HTTP',
-        `${req.method} ${req.originalUrl} -> ${res.statusCode} (${elapsedMs}ms)`, {
-          requestId,
-          ip: req.ip,
-          origin: req.get('origin') || null,
-          referer: req.get('referer') || null,
-          userAgent: req.get('user-agent') || null,
-          params: req.params,
-          query: req.query,
-          body: req.body,
-          response: res.locals.imoveResponseBody || null,
-          authUserId: req.auth?.user?._id ? String(req.auth.user._id) : null,
-          adminUserId: req.admin?._id ? String(req.admin._id) : null,
-        });
-    } else if (String(process.env.LOG_HTTP_SUCCESS || 'false').toLowerCase() === 'true') {
-      diagnosticLog('INFO', 'HTTP', `${req.method} ${req.originalUrl} -> ${res.statusCode} (${elapsedMs}ms)`, {
-        requestId,
-        origin: req.get('origin') || null,
-      });
-    }
-  });
-  next();
-});
 function isLoopbackAddress(value) {
   const address = String(value || '').replace(/^::ffff:/, '');
   return address === '127.0.0.1' || address === '::1';
@@ -199,10 +82,6 @@ app.use((req, res, next) => {
 });
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors(buildCorsOptions()));
-app.use((_req, res, next) => {
-  res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id, X-IMove-Driver-Status, X-IMove-Reason');
-  next();
-});
 app.use(express.json({ limit: '1mb' }));
 app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: Math.max(60, Number(process.env.API_RATE_LIMIT_PER_MINUTE || 600)), standardHeaders: 'draft-7', legacyHeaders: false }));
 
@@ -251,86 +130,6 @@ function safeObjectId(value) {
 function maskedMongoUri() {
   if (!MONGODB_URI) return '(chua cau hinh)';
   return MONGODB_URI.replace(/(mongodb(?:\+srv)?:\/\/[^:]+:)[^@]+@/i, '$1********@');
-}
-
-// Core readiness must represent the availability of the booking/dispatch core.
-// Optional integrations (for example FCM or Redis when required=false) are reported
-// separately and must not make Admin think the whole backend is offline.
-function normalizeCoreHealth(health = {}) {
-  const components = { ...(health.components || {}) };
-  const requiredNames = ['api', 'mongodb', 'matching', 'dispatch', 'socket'];
-  const requiredFailures = [];
-
-  for (const name of requiredNames) {
-    if (components[name]?.ok !== true) requiredFailures.push(name);
-  }
-  for (const name of ['redis', 'fcm']) {
-    if (components[name]?.required === true && components[name]?.ok !== true) requiredFailures.push(name);
-  }
-
-  const coreReady = requiredFailures.length === 0;
-  const warnings = Array.isArray(health.warnings) ? [...health.warnings] : [];
-  if (components.fcm && components.fcm.configured === false && !warnings.includes('FCM_NOT_CONFIGURED')) warnings.push('FCM_NOT_CONFIGURED');
-  if (components.redis && components.redis.configured === false && !warnings.includes('REDIS_NOT_CONFIGURED')) warnings.push('REDIS_NOT_CONFIGURED');
-
-  return {
-    ...health,
-    components,
-    ok: coreReady,
-    ready: coreReady,
-    backend: true,
-    database: components.mongodb?.ok === true,
-    requiredFailures,
-    warnings,
-  };
-}
-
-async function buildPublicHealthPayload() {
-  try {
-    const rawHealth = await productionService.systemHealth();
-    const health = normalizeCoreHealth(rawHealth);
-    mongoConnected = Boolean(health.components?.mongodb?.ok);
-    return {
-      ...health,
-      success: health.ready,
-      ok: health.ready,
-      ready: health.ready,
-      backend: true,
-      coreBackend: true,
-      service: 'TH79_IMOVE_CORE',
-      name: 'TH79 iMove API',
-      version: APP_VERSION,
-      database: mongoConnected,
-      databaseName: DB_NAME,
-      mongoConfigured: Boolean(MONGODB_URI),
-      lastMongoError,
-      environment: NODE_ENV,
-      publicUrl: String(process.env.CORE_PUBLIC_URL || '').trim() || null,
-      diagnostics: {
-        envFilePresent: ENV_INSPECTION.exists,
-        duplicateEnvKeys: ENV_INSPECTION.duplicates,
-        requestLogging: true,
-      },
-    };
-  } catch (error) {
-    return {
-      success: false,
-      ok: false,
-      ready: false,
-      backend: true,
-      coreBackend: true,
-      service: 'TH79_IMOVE_CORE',
-      name: 'TH79 iMove API',
-      version: APP_VERSION,
-      database: false,
-      databaseName: DB_NAME,
-      mongoConfigured: Boolean(MONGODB_URI),
-      lastMongoError: lastMongoError || error.message,
-      environment: NODE_ENV,
-      error: { code: error.code || 'HEALTH_CHECK_FAILED', message: error.message },
-      generatedAt: new Date(),
-    };
-  }
 }
 
 async function ensureCustomer({ phone, fullName, email }) {
@@ -563,50 +362,56 @@ app.get('/live', (_req, res) => {
   });
 });
 
-// Public health endpoints used by Nginx, Vercel Admin and legacy Admin builds.
-// Keep these endpoints UNAUTHENTICATED so the login screen can verify Core Backend
-// before an admin access token exists.
-const PUBLIC_HEALTH_PATHS = [
-  '/health',
-  '/api/health',
-  '/api/core/health',
-  '/api/admin/health',
-  '/api/v73/health',
-  '/api/v73/admin/health',
-];
-app.get(PUBLIC_HEALTH_PATHS, async (req, res) => {
-  const payload = await buildPublicHealthPayload();
-  const status = payload.database ? 200 : 503;
-  if (status >= 500) {
-    diagnosticLog('ERROR', 'CORE_HEALTH', `Core health failed -> ${status}`, {
-      requestId: req.requestId || null,
-      requiredFailures: payload.requiredFailures || [],
-      lastMongoError: payload.lastMongoError || null,
+// Health: endpoint ổn định cho Admin Gateway/Nginx. HTTP 200 khi MongoDB sẵn sàng.
+app.get('/health', async (_req, res) => {
+  try {
+    const health = await productionService.systemHealth();
+    mongoConnected = Boolean(health?.components?.mongodb?.ok);
+    const payload = {
+      ...health,
+      ok: mongoConnected,
+      ready: Boolean(health?.ok),
+      backend: true,
+      service: 'TH79_IMOVE_CORE',
+      name: 'TH79 iMove API',
+      version: APP_VERSION,
+      database: mongoConnected,
+      databaseName: DB_NAME,
+      mongoConfigured: Boolean(MONGODB_URI),
+      lastMongoError,
+    };
+    if (!PRODUCTION) payload.mongoUri = maskedMongoUri();
+    return res.status(mongoConnected ? 200 : 503).json(payload);
+  } catch (error) {
+    return res.status(503).json({
+      ok: false,
+      ready: false,
+      backend: true,
+      service: 'TH79_IMOVE_CORE',
+      name: 'TH79 iMove API',
+      version: APP_VERSION,
+      message: error.message,
     });
   }
-  return res.status(status).json(payload);
 });
 
-// Lighter readiness result for infrastructure. Optional integrations do not fail
-// readiness unless explicitly configured as required.
-app.get('/ready', async (req, res) => {
-  const payload = await buildPublicHealthPayload();
-  return res.status(payload.ready ? 200 : 503).json({
-    success: payload.ready,
-    ok: payload.ready,
-    ready: payload.ready,
-    backend: true,
-    coreBackend: true,
-    service: payload.service,
-    version: payload.version,
-    environment: payload.environment,
-    components: payload.components,
-    warnings: payload.warnings,
-    requiredFailures: payload.requiredFailures,
-    requestId: req.requestId || null,
-    generatedAt: payload.generatedAt || new Date(),
-  });
+// Readiness: dùng cho kiểm tra toàn bộ dependency được cấu hình là bắt buộc.
+app.get('/ready', async (_req, res) => {
+  try {
+    const health = await productionService.systemHealth();
+    return res.status(health.ok ? 200 : 503).json({
+      ok: health.ok,
+      backend: true,
+      service: 'TH79_IMOVE_CORE',
+      version: APP_VERSION,
+      components: health.components,
+      generatedAt: health.generatedAt,
+    });
+  } catch (error) {
+    return res.status(503).json({ ok: false, backend: true, service: 'TH79_IMOVE_CORE', version: APP_VERSION, message: error.message });
+  }
 });
+
 
 app.get('/api/network/info', (_req, res) => {
   res.json({
@@ -651,12 +456,7 @@ const {
   requireCancelParticipant,
 } = createBookingSecurity({ getDb: () => db });
 app.use('/api/kyc', createKycRouter({ getDb: () => db }));
-const adminAuthRouter = createAdminAuthRouter({ getDb: () => db });
-app.use('/api/admin-auth', adminAuthRouter);
-// Compatibility aliases for older/newer Admin builds. These keep login public;
-// protected /api/v73/admin/* routes continue to the production admin router.
-app.use('/api/v73/admin-auth', adminAuthRouter);
-app.use('/api/v73/admin', adminAuthRouter);
+app.use('/api/admin-auth', createAdminAuthRouter({ getDb: () => db }));
 app.use('/api/v7/admin', createAdminOpsRouter({ getDb: () => db }));
 app.use('/api/v8/admin/matching', createMatchingAdminRouter({ getDb: () => db, getMatching: () => matching }));
 platformService = createPlatformService({
@@ -696,7 +496,7 @@ app.post('/api/v69/driver/offers/:offerId/decline', requireApprovedDriver, async
   catch(e){return res.status(e.code==='OFFER_NOT_ACTIVE'?409:500).json({code:e.code||null,message:e.message});}
 });
 app.post('/api/v69/driver/heartbeat', requireApprovedDriver, async (req, res) => {
-  try { const found=await findDriverByPhone(req.auth.user.phone); if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'}); const nowDate=new Date(); const lat=Number(req.body?.lat),lng=Number(req.body?.lng); await db.collection('drivers').updateOne({_id:found.driver._id},{$set:{lastHeartbeatAt:nowDate,lastSeenAt:nowDate,updatedAt:nowDate}}); if(Number.isFinite(lat)&&Number.isFinite(lng)) { await db.collection('driver_locations').updateOne({driverId:found.driver._id},{$set:{driverId:found.driver._id,location:{type:'Point',coordinates:[lng,lat]},heading:Number(req.body?.heading||0),speed:Number(req.body?.speed||0),updatedAt:nowDate},$setOnInsert:{createdAt:nowDate}},{upsert:true}); if(trustService) await trustService.analyzeLocation({driverId:found.driver._id,userId:found.user._id,lat,lng,isMocked:Boolean(req.body?.isMocked),accuracy:req.body?.accuracy,timestamp:req.body?.timestamp}); } return res.json({ok:true,serverTime:nowDate}); } catch(e){return res.status(500).json({message:e.message});}
+  try { const found=await findDriverByPhone(req.auth.user.phone); if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'}); const nowDate=new Date(); const lat=Number(req.body?.lat),lng=Number(req.body?.lng); await db.collection('drivers').updateOne({_id:found.driver._id},{$set:{lastHeartbeatAt:nowDate,updatedAt:nowDate}}); if(Number.isFinite(lat)&&Number.isFinite(lng)) { await db.collection('driver_locations').updateOne({driverId:found.driver._id},{$set:{driverId:found.driver._id,location:{type:'Point',coordinates:[lng,lat]},heading:Number(req.body?.heading||0),speed:Number(req.body?.speed||0),updatedAt:nowDate},$setOnInsert:{createdAt:nowDate}},{upsert:true}); if(trustService) await trustService.analyzeLocation({driverId:found.driver._id,userId:found.user._id,lat,lng,isMocked:Boolean(req.body?.isMocked),accuracy:req.body?.accuracy,timestamp:req.body?.timestamp}); } return res.json({ok:true,serverTime:nowDate}); } catch(e){return res.status(500).json({message:e.message});}
 });
 app.get('/api/v69/driver/notifications', requireApprovedDriver, async (req,res)=>{const found=await findDriverByPhone(req.auth.user.phone);if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'});return res.json(await notificationService.listNotifications(found.driver._id,req.query.limit));});
 app.get('/api/v69/customer/notifications', requireCustomer, async (req,res)=>res.json(await notificationService.listNotifications(req.auth.user._id,req.query.limit)));
@@ -947,17 +747,9 @@ app.post('/api/drivers/status', requireApprovedDriver, async (req, res) => {
     }
 
     const onlineStatus = isOnline ? 'ONLINE' : 'OFFLINE';
-    const statusChangedAt = now();
     await db.collection('drivers').updateOne(
       { _id: found.driver._id },
-      {
-        $set: {
-          onlineStatus,
-          lastSeenAt: statusChangedAt,
-          ...(isOnline ? { lastHeartbeatAt: statusChangedAt } : {}),
-          updatedAt: statusChangedAt,
-        },
-      },
+      { $set: { onlineStatus, updatedAt: now() } },
     );
 
     if (!isOnline && matching) {
@@ -993,10 +785,7 @@ app.post('/api/drivers/status', requireApprovedDriver, async (req, res) => {
       } catch (_) {}
     }
 
-    diagnosticLog('INFO', 'DRIVER_STATUS', `Driver ${onlineStatus}`, {
-      driverId: String(found.driver._id), phone, onlineStatus, requestId: req.requestId || null,
-    });
-    return res.json({ ok: true, onlineStatus, pointStatus, serverTime: statusChangedAt });
+    return res.json({ ok: true, onlineStatus, pointStatus });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -1006,14 +795,6 @@ app.post('/api/drivers/location', requireApprovedDriver, async (req, res) => {
   try {
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
     const result = await matching.updateLocationByContext(req.driverContext, req.body || {});
-    const driverId = req.driverContext?.driver?._id || req.driverContext?.driverId || null;
-    if (driverId) {
-      const seenAt = now();
-      await db.collection('drivers').updateOne(
-        { _id: driverId },
-        { $set: { lastHeartbeatAt: seenAt, lastSeenAt: seenAt, updatedAt: seenAt } },
-      );
-    }
     return res.json(result);
   } catch (error) {
     const status = error.code === 'DRIVER_OFFLINE' ? 409 : 400;
@@ -1140,11 +921,11 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
     await addEvent(result.insertedId, 'BOOKING_CREATED', 'CUSTOMER', customerUser._id, { status: 'SEARCHING', serviceCode, promotionCode: promotionSnapshot?.code || null });
     if (dispatchEngine) {
       setImmediate(() => dispatchEngine.dispatchWithRetry(result.insertedId, { reset: true }).catch((error) => {
-        logError('DISPATCH_CREATE_BOOKING', error, { bookingId: String(result.insertedId), serviceCode });
+        console.error('[V6.9 Dispatch] Dispatch booking failed:', error.message);
       }));
     } else if (matching) {
       setImmediate(() => matching.dispatchBooking(result.insertedId).catch((error) => {
-        logError('MATCHING_CREATE_BOOKING', error, { bookingId: String(result.insertedId), serviceCode });
+        console.error('[Matching] Dispatch booking failed:', error.message);
       }));
     }
     return res.status(201).json(serializeBooking(doc));
@@ -1164,33 +945,19 @@ app.get('/api/bookings/available', requireApprovedDriver, async (req, res) => {
     if (found.driver.approvalStatus !== 'APPROVED' || found.driver.kycStatus !== 'APPROVED') {
       return res.status(403).json({ message: 'Tài xế chưa được duyệt đầy đủ KYC.' });
     }
-    // Polling từ Driver app cũng là tín hiệu presence khi app đang hoạt động.
-    // BUSY/OFFLINE là trạng thái bình thường, không trả 403 liên tục gây spam log/F12.
+    // BUSY is an expected state while the driver is performing a trip.
+    // The Driver app may still issue a fallback poll during route transitions;
+    // return an empty offer list instead of a noisy 403. OFFLINE remains forbidden.
     if (found.driver.onlineStatus === 'BUSY') {
-      res.setHeader('X-IMove-Driver-Status', 'BUSY');
       return res.json([]);
     }
     if (found.driver.onlineStatus !== 'ONLINE') {
-      res.setHeader('X-IMove-Driver-Status', String(found.driver.onlineStatus || 'OFFLINE'));
-      res.setHeader('X-IMove-Reason', 'DRIVER_OFFLINE');
-      diagnosticLog('INFO', 'DRIVER_POLL', 'Driver poll khi đang OFFLINE', {
-        driverId: String(found.driver._id), phone: driverPhone, requestId: req.requestId || null,
-      });
-      return res.json([]);
+      return res.status(403).json({ message: 'Tài xế đang OFFLINE.' });
     }
-
-    const pollSeenAt = now();
-    await db.collection('drivers').updateOne(
-      { _id: found.driver._id, onlineStatus: 'ONLINE' },
-      { $set: { lastHeartbeatAt: pollSeenAt, lastSeenAt: pollSeenAt, updatedAt: pollSeenAt } },
-    );
-    res.setHeader('X-IMove-Driver-Status', 'ONLINE');
-
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
     return res.json(await matching.getAvailableOffers(found.driver._id));
   } catch (error) {
-    logError('BOOKINGS_AVAILABLE', error, { requestId: req.requestId || null, phone: req.auth?.user?.phone || null });
-    return res.status(500).json({ message: error.message, requestId: req.requestId || null });
+    return res.status(500).json({ message: error.message });
   }
 });
 
@@ -1361,7 +1128,7 @@ app.post('/api/bookings/:id/status', requireAssignedDriver, async (req, res) => 
         title: statusPush[0],
         body: statusPush[1],
         data: { bookingId: String(id), status: nextStatus },
-      }).catch((e) => logError('STATUS_PUSH', e, { bookingId: String(id), nextStatus }));
+      }).catch((e) => console.error('[V6.9 Status Push]', e.message));
     }
 
     if (nextStatus === 'COMPLETED') {
@@ -1388,7 +1155,7 @@ app.post('/api/bookings/:id/status', requireAssignedDriver, async (req, res) => 
         await matching?.onBookingTerminal(doc);
         await dispatchEngine?.cancelBooking(doc._id, 'BOOKING_TERMINAL');
       } catch (cleanupError) {
-        logError('BOOKING_COMPLETE_CLEANUP', cleanupError, { bookingId: String(id) });
+        console.error('[Booking Complete Cleanup]', cleanupError.message);
       }
     } else {
       matching?.emitBookingUpdate(doc);
@@ -1583,6 +1350,7 @@ app.get('/api/customers/:phone/bookings', requireCustomer, async (req, res) => {
 // https://backendimove.daututh79.com/api/... directly without any Nginx changes.
 const adminConsoleRouter = createAdminConsoleRouter({
   getDb: () => db,
+  getMatching: () => matching,
   appVersion: APP_VERSION,
   backendUrl: String(process.env.CORE_PUBLIC_URL || 'https://backendimove.daututh79.com'),
 });
@@ -1650,42 +1418,6 @@ async function connectMongo() {
 let discoveryService = null;
 let registryService = null;
 
-// Final API diagnostics: log unknown routes and uncaught Express errors.
-app.use((req, res, next) => {
-  if (res.headersSent) return next();
-  diagnosticLog('WARN', 'ROUTE_NOT_FOUND', `${req.method} ${req.originalUrl}`, {
-    requestId: req.requestId || null,
-    ip: req.ip,
-    query: req.query,
-    body: req.body,
-  });
-  return res.status(404).json({
-    ok: false,
-    code: 'ROUTE_NOT_FOUND',
-    message: `Không tìm thấy API ${req.method} ${req.originalUrl}`,
-    requestId: req.requestId || null,
-  });
-});
-
-app.use((err, req, res, _next) => {
-  logError('EXPRESS_UNHANDLED', err, {
-    requestId: req.requestId || null,
-    method: req.method,
-    url: req.originalUrl,
-    ip: req.ip,
-    params: req.params,
-    query: req.query,
-    body: req.body,
-  });
-  if (res.headersSent) return;
-  return res.status(Number(err?.status || err?.statusCode || 500)).json({
-    ok: false,
-    code: err?.code || 'INTERNAL_SERVER_ERROR',
-    message: PRODUCTION ? 'Backend gặp lỗi nội bộ. Kiểm tra console bằng requestId.' : (err?.message || 'Internal Server Error'),
-    requestId: req.requestId || null,
-  });
-});
-
 const server = app.listen(PORT, HOST, () => {
   console.log('======================================================');
   console.log(` TH79 iMove Core Backend ${APP_VERSION}`);
@@ -1698,8 +1430,6 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`Public URL       : ${String(process.env.CORE_PUBLIC_URL || '(chưa cấu hình)').trim()}`);
   console.log(`Database         : ${DB_NAME}`);
   console.log(`Mongo configured : ${MONGODB_URI ? 'YES' : 'NO'}`);
-  console.log(`CORS origins     : ${String(process.env.CORS_ORIGINS || '(chưa cấu hình)').trim()}`);
-  console.log(`ENV duplicates   : ${ENV_INSPECTION.duplicates.length ? ENV_INSPECTION.duplicates.join(', ') : 'NONE'}`);
 
   const discoveryPort = Number(process.env.LAN_DISCOVERY_PORT || 5051);
   if (LAN_DISCOVERY_ENABLED) {
@@ -1730,7 +1460,7 @@ server.on('error', (error) => {
   if (error?.code === 'EADDRINUSE') {
     console.error(`[HTTP] Port ${PORT} đang được sử dụng. Kiểm tra PM2/process cũ trước khi chạy lại.`);
   } else {
-    logError('HTTP_SERVER', error, { port: PORT, host: HOST });
+    console.error('[HTTP] Server error:', error);
   }
 });
 
@@ -1751,7 +1481,7 @@ dispatchEngine = createDispatchEngine({
   addEvent,
 });
 trustService = createTrustService({ getDb: () => db, notificationService: notificationService });
-productionService.startRedis().catch((e) => logError('REDIS_START', e));
+productionService.startRedis().catch((e) => console.error('[V7.3 Redis]', e.message));
 notificationService.start();
 dispatchEngine.start();
 commerceDispatchWorker = createCommerceDispatchWorker({
@@ -1761,43 +1491,6 @@ commerceDispatchWorker = createCommerceDispatchWorker({
 });
 commerceDispatchWorker.start();
 
-// Convert stale ONLINE flags into real presence. A driver remains ONLINE only while
-// heartbeat/location updates are fresh. BUSY drivers are intentionally excluded.
-const driverPresenceTimer = setInterval(async () => {
-  if (!db || !mongoConnected) return;
-  try {
-    const cutoff = new Date(Date.now() - DRIVER_PRESENCE_FRESH_MS);
-    const freshLocationDriverIds = await db.collection('driver_locations')
-      .find({ updatedAt: { $gte: cutoff } })
-      .project({ driverId: 1, _id: 0 })
-      .toArray();
-    const freshIds = freshLocationDriverIds.map((row) => row.driverId).filter(Boolean);
-
-    const staleFilter = {
-      onlineStatus: 'ONLINE',
-      $and: [
-        { $or: [{ lastHeartbeatAt: { $lt: cutoff } }, { lastHeartbeatAt: { $exists: false } }, { lastHeartbeatAt: null }] },
-        ...(freshIds.length ? [{ _id: { $nin: freshIds } }] : []),
-      ],
-    };
-
-    const changedAt = now();
-    const result = await db.collection('drivers').updateMany(
-      staleFilter,
-      { $set: { onlineStatus: 'OFFLINE', presenceExpiredAt: changedAt, updatedAt: changedAt } },
-    );
-    if (result.modifiedCount > 0) {
-      diagnosticLog('WARN', 'PRESENCE', `Đã chuyển ${result.modifiedCount} tài xế ONLINE cũ sang OFFLINE`, {
-        cutoff: cutoff.toISOString(), freshMs: DRIVER_PRESENCE_FRESH_MS,
-        reason: 'Không có heartbeat/location/poll mới trong thời gian cho phép',
-      });
-    }
-  } catch (error) {
-    logError('PRESENCE_SWEEP', error);
-  }
-}, DRIVER_PRESENCE_SWEEP_MS);
-driverPresenceTimer.unref?.();
-
 connectMongo();
 
 let shuttingDown = false;
@@ -1806,7 +1499,6 @@ async function shutdown(signal = 'SIGTERM', exitCode = 0) {
   shuttingDown = true;
   console.log(`[Shutdown] ${signal} - đang đóng dịch vụ...`);
   clearTimeout(retryTimer);
-  clearInterval(driverPresenceTimer);
   try { discoveryService?.close(); } catch (_) {}
   try { registryService?.close(); } catch (_) {}
   try { commerceDispatchWorker?.close(); } catch (_) {}
@@ -1830,10 +1522,10 @@ async function shutdown(signal = 'SIGTERM', exitCode = 0) {
 process.on('SIGINT', () => shutdown('SIGINT', 0));
 process.on('SIGTERM', () => shutdown('SIGTERM', 0));
 process.on('unhandledRejection', (error) => {
-  logError('UNHANDLED_REJECTION', error);
+  console.error('[Process] Unhandled rejection:', error);
 });
 process.on('uncaughtException', (error) => {
-  logError('UNCAUGHT_EXCEPTION', error);
+  console.error('[Process] Uncaught exception:', error);
   shutdown('uncaughtException', 1).catch(() => process.exit(1));
 });
 
