@@ -1,5 +1,8 @@
 const express = require('express');
 const { ObjectId } = require('mongodb');
+const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
 const { createAuthenticate } = require('./auth_routes');
 const { createAdminGuard } = require('./admin_guard');
 
@@ -86,6 +89,60 @@ function serialize(value) {
   }
   return out;
 }
+
+const MERCHANT_MEDIA_ROOT = path.resolve(
+  __dirname,
+  '..',
+  String(process.env.LOCAL_UPLOAD_ROOT || 'storage').trim() || 'storage',
+  'merchant',
+);
+
+function merchantMediaExtension(file) {
+  const mime = String(file?.mimetype || '').toLowerCase();
+  if (mime === 'image/png') return '.png';
+  if (mime === 'image/webp') return '.webp';
+  return '.jpg';
+}
+
+const merchantMediaUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, _file, cb) {
+      const merchantId = String(req.merchantContext?.merchant?._id || 'unknown');
+      const dir = path.join(MERCHANT_MEDIA_ROOT, merchantId);
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename(req, file, cb) {
+      const kind = String(req.params.kind || 'image').toLowerCase();
+      const safeKind = ['logo', 'cover'].includes(kind) ? kind : 'image';
+      cb(null, `${safeKind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${merchantMediaExtension(file)}`);
+    },
+  }),
+  limits: {
+    fileSize: Math.max(1, Number(process.env.MERCHANT_MEDIA_MAX_FILE_MB || 8)) * 1024 * 1024,
+  },
+  fileFilter(_req, file, cb) {
+    const allowed = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+    if (!allowed.has(String(file?.mimetype || '').toLowerCase())) {
+      return cb(new Error('Chỉ hỗ trợ ảnh JPG, PNG hoặc WEBP.'));
+    }
+    cb(null, true);
+  },
+});
+
+function merchantMediaPublicPath(merchantId, filename) {
+  return `/api/v16/commerce/merchant-media/${encodeURIComponent(String(merchantId))}/${encodeURIComponent(path.basename(filename))}`;
+}
+
+function deleteOldMerchantMedia(urlValue, merchantId) {
+  const value = String(urlValue || '');
+  const prefix = `/api/v16/commerce/merchant-media/${String(merchantId)}/`;
+  if (!value.includes(prefix)) return;
+  const name = decodeURIComponent(value.split(prefix).pop() || '');
+  if (!name || name !== path.basename(name)) return;
+  fs.promises.unlink(path.join(MERCHANT_MEDIA_ROOT, String(merchantId), name)).catch(() => {});
+}
+
 function orderCode() {
   const d = new Date();
   const stamp = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
@@ -200,6 +257,9 @@ async function dispatchCommerceReady({ db, order, notificationService, actorType
         dispatchStatus: candidates.length ? 'SEARCHING' : 'NO_DRIVER',
         dispatchStartedAt: now,
         dispatchCandidateCount: candidates.length,
+        dispatchTriggeredBy: actorType,
+        dispatchTriggeredById: actorId || null,
+        dispatchUpdatedAt: now,
         updatedAt: now,
       },
       $push: {
@@ -277,6 +337,20 @@ async function assignCommerceDriver({ db, order, driverId, notificationService, 
 
 function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNotifications }) {
   const r = express.Router();
+  r.get('/merchant-media/:merchantId/:filename', async (req,res) => {
+    try {
+      const merchantId = oid(req.params.merchantId);
+      if (!merchantId) return res.status(400).json({ message:'Merchant ID không hợp lệ.' });
+      const filename = path.basename(String(req.params.filename || ''));
+      if (!filename) return res.status(404).end();
+      const file = path.join(MERCHANT_MEDIA_ROOT, String(merchantId), filename);
+      if (!fs.existsSync(file)) return res.status(404).end();
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.sendFile(file);
+    } catch (e) {
+      return res.status(404).json({ message:'Không tìm thấy ảnh.' });
+    }
+  });
   r.get('/merchants', async (req,res) => {
     try {
       const q = { status: { $in:['ACTIVE','OPEN','BUSY'] } };
@@ -410,20 +484,41 @@ function createMerchantRouter({ getDb, getNotifications }) {
       if(!allowed.includes(next))return res.status(409).json({message:`Merchant không thể chuyển ${current.status} → ${next}.`});
       const now=new Date();
       await db.collection('orders').updateOne({_id},{$set:{status:next,updatedAt:now,...(next==='READY_FOR_PICKUP'?{readyAt:now}:{}),...(next==='CANCELLED'?{cancelledAt:now,cancelReason:String(req.body?.reason||'MERCHANT_CANCELLED')}: {})},$push:{timeline:{status:next,at:now,actorType:'MERCHANT',actorId:req.auth.user._id}}});
-      const updatedOrder=await db.collection('orders').findOne({_id});
+      let updatedOrder=await db.collection('orders').findOne({_id});
+      let dispatchResult=null;
       if(next==='READY_FOR_PICKUP' && updatedOrder){
-        await dispatchCommerceReady({
+        dispatchResult=await dispatchCommerceReady({
           db, order:updatedOrder,
           notificationService:getNotifications?getNotifications():null,
           actorType:'MERCHANT', actorId:req.auth.user._id,
         });
+        await db.collection('audit_logs').insertOne({
+          actorType:'MERCHANT',
+          actorId:req.auth.user._id,
+          action:'COMMERCE_READY_DISPATCH',
+          entityType:'ORDER',
+          entityId:String(_id),
+          after:{
+            serviceCode:updatedOrder.serviceCode,
+            merchantId:String(req.merchantContext.merchant._id),
+            candidateCount:Number(dispatchResult?.candidates?.length||0),
+          },
+          createdAt:new Date(),
+        }).catch(()=>{});
+        updatedOrder=await db.collection('orders').findOne({_id});
       }
       if(getNotifications && updatedOrder?.customerId){
         const labels={MERCHANT_ACCEPTED:['Cửa hàng đã xác nhận','Đơn hàng của bạn đã được cửa hàng xác nhận.'],PREPARING:['Đang chuẩn bị','Cửa hàng đang chuẩn bị đơn hàng của bạn.'],READY_FOR_PICKUP:['Sẵn sàng lấy hàng','Đơn đã sẵn sàng để tài xế đến nhận.'],CANCELLED:['Đơn đã bị hủy','Cửa hàng không thể tiếp tục xử lý đơn này.']};
         const msg=labels[next];
         if(msg) await getNotifications().enqueue({dedupeKey:`ORDER:${String(_id)}:${next}`,type:'COMMERCE_ORDER',targetType:'CUSTOMER',targetId:updatedOrder.customerId,title:msg[0],body:msg[1],data:{orderId:String(_id),status:next,serviceCode:updatedOrder.serviceCode}}).catch(()=>{});
       }
-      res.json({order:serialize(updatedOrder)});
+      res.json({
+        order:serialize(updatedOrder),
+        dispatch:dispatchResult?{
+          candidateCount:Number(dispatchResult.candidates?.length||0),
+          status:Number(dispatchResult.candidates?.length||0)>0?'SEARCHING':'NO_DRIVER',
+        }:null,
+      });
     }catch(e){res.status(400).json({message:e.message});}
   });
   r.get('/products', async (req,res)=>{try{const rows=await getDb().collection('products').find({merchantId:req.merchantContext.merchant._id}).sort({categoryName:1,sortOrder:1,name:1}).toArray();res.json({products:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
@@ -436,6 +531,27 @@ function createMerchantRouter({ getDb, getNotifications }) {
   r.get('/store', (req,res)=>res.json({merchant:serialize(req.merchantContext.merchant)}));
   r.put('/store', async (req,res)=>{
     try{const patch={};for(const k of ['name','address','phone','description','status','openingHours','pickupInstruction','logoUrl','coverUrl','categoryName'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];if(req.body?.merchantType!==undefined){const type=String(req.body.merchantType).toUpperCase();if(!['STORE','RESTAURANT'].includes(type))return res.status(400).json({message:'merchantType phải là STORE hoặc RESTAURANT.'});patch.merchantType=type;patch.merchantTypeLabel=type==='RESTAURANT'?'Nhà hàng · Food':'Cửa hàng · Đặt hộ';patch.categoryCode=type==='RESTAURANT'?'FOOD':'ERRAND';}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id:req.merchantContext.merchant._id},{$set:patch});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id}))});}catch(e){res.status(400).json({message:e.message});}
+  });
+  r.post('/store/media/:kind', merchantMediaUpload.single('image'), async (req,res)=>{
+    try {
+      const kind=String(req.params.kind||'').toLowerCase();
+      if(!['logo','cover'].includes(kind))return res.status(400).json({message:'kind phải là logo hoặc cover.'});
+      if(!req.file)return res.status(400).json({message:'Chưa chọn file ảnh.'});
+      const merchantId=req.merchantContext.merchant._id;
+      const field=kind==='logo'?'logoUrl':'coverUrl';
+      const current=await getDb().collection('merchants').findOne({_id:merchantId});
+      const mediaUrl=merchantMediaPublicPath(merchantId,req.file.filename);
+      await getDb().collection('merchants').updateOne(
+        {_id:merchantId},
+        {$set:{[field]:mediaUrl,updatedAt:new Date()}},
+      );
+      deleteOldMerchantMedia(current?.[field],merchantId);
+      const merchant=await getDb().collection('merchants').findOne({_id:merchantId});
+      return res.json({merchant:serialize(merchant),kind,url:mediaUrl});
+    } catch(e) {
+      if(req.file?.path)fs.promises.unlink(req.file.path).catch(()=>{});
+      return res.status(400).json({message:e.message});
+    }
   });
   r.get('/settlements', async (req,res)=>{try{const rows=await getDb().collection('merchant_settlements').find({merchantId:req.merchantContext.merchant._id}).sort({periodEnd:-1,createdAt:-1}).limit(100).toArray();res.json({settlements:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
   return r;

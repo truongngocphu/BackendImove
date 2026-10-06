@@ -85,14 +85,8 @@ async function sendViaSpeedSms({ phone, message }) {
       to: [normalizeSpeedSmsPhone(phone)],
       content: message,
       sms_type: smsType,
+      ...(sender ? { sender } : {}),
     };
-
-    // SpeedSMS type=2 (random number) does not need a sender/brandname.
-    // Sending sender="" makes SpeedSMS answer: "sender not found".
-    // Only include sender when it is actually configured.
-    if (sender) {
-      payload.sender = sender;
-    }
 
     const response = await fetch(url, {
       method: 'POST',

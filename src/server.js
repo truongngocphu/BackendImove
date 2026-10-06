@@ -1350,6 +1350,7 @@ app.get('/api/customers/:phone/bookings', requireCustomer, async (req, res) => {
 // https://backendimove.daututh79.com/api/... directly without any Nginx changes.
 const adminConsoleRouter = createAdminConsoleRouter({
   getDb: () => db,
+  getMatching: () => matching,
   appVersion: APP_VERSION,
   backendUrl: String(process.env.CORE_PUBLIC_URL || 'https://backendimove.daututh79.com'),
 });
