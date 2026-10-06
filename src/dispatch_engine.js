@@ -187,10 +187,74 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       } catch (e) { if (e.code !== 11000) throw e; offer = await db.collection('booking_offers_v69').findOne({ bookingId, driverId, dispatchVersion }); }
       if (!offer) continue;
       const payload = serializeBooking(booking);
-      getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: payload, round: nextRound, matchingScore: c.score });
-      await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.socketSent': true, updatedAt: new Date() } });
-      await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER:${bookingId}:${driverId}:${dispatchVersion}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến mới', body: c.distanceKm == null ? 'Có khách đang chờ bạn nhận chuyến.' : `Điểm đón cách bạn ${Number(c.distanceKm).toFixed(1)} km`, data: { bookingId, offerId: offer._id, dispatchVersion, expiresAt } });
-      await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.fcmQueued': true } });
+
+      // Socket/polling is the primary offer channel. A notification/FCM problem must
+      // never cancel a valid offer and restart dispatch. Driver App also polls the
+      // active-offer endpoint, so keep the PENDING offer alive even when FCM is off.
+      let socketSent = false;
+      try {
+        getMatching().emitToDriver(driverId, 'v69:booking_offer', {
+          offerId: String(offer._id),
+          expiresAt: expiresAt.toISOString(),
+          booking: payload,
+          round: nextRound,
+          matchingScore: c.score,
+        });
+        socketSent = true;
+      } catch (socketError) {
+        console.warn('[V6.9 Dispatch] Socket offer warning:', socketError?.message || socketError);
+      }
+
+      let notificationQueued = false;
+      let notificationError = null;
+      try {
+        if (notificationService?.enqueue) {
+          await notificationService.enqueue({
+            dedupeKey: `BOOKING_OFFER:${bookingId}:${driverId}:${dispatchVersion}`,
+            type: 'BOOKING_OFFER',
+            targetType: 'DRIVER',
+            targetId: driverId,
+            bookingId,
+            offerId: offer._id,
+            title: 'Có chuyến mới',
+            body: c.distanceKm == null
+              ? 'Có khách đang chờ bạn nhận chuyến.'
+              : `Điểm đón cách bạn ${Number(c.distanceKm).toFixed(1)} km`,
+            data: {
+              bookingId,
+              offerId: offer._id,
+              dispatchVersion,
+              expiresAt,
+            },
+          });
+          notificationQueued = true;
+        }
+      } catch (notifyError) {
+        notificationError = String(notifyError?.message || notifyError || 'NOTIFICATION_ERROR');
+        console.warn(
+          `[V6.9 Dispatch] Offer ${String(offer._id)} vẫn giữ PENDING; notification lỗi:`,
+          notificationError,
+        );
+        await event(bookingId, 'OFFER_NOTIFICATION_DEGRADED', {
+          driverId,
+          offerId: offer._id,
+          round: nextRound,
+          dispatchVersion,
+          message: notificationError,
+        }).catch(() => {});
+      }
+
+      await db.collection('booking_offers_v69').updateOne(
+        { _id: offer._id },
+        {
+          $set: {
+            'notification.socketSent': socketSent,
+            'notification.fcmQueued': notificationQueued,
+            'notification.lastError': notificationError,
+            updatedAt: new Date(),
+          },
+        },
+      );
     }
     await db.collection('bookings').updateOne({ _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } }, { $set: { status: 'OFFERED', dispatchEngine: { version: dispatchVersion, currentRound: nextRound, status: 'WAITING', roundExpiresAt: expiresAt, startedAt: booking.dispatchEngine?.startedAt || now, updatedAt: now }, updatedAt: now } });
     await event(bookingId, 'ROUND_STARTED', { round: nextRound, dispatchVersion, candidateCount: candidates.length, expiresAt, adminId });

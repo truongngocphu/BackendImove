@@ -423,14 +423,42 @@ function createMatchingEngine({
   async function getDriverContextById(driverId, serviceCode = null) {
     const db = getDb();
     if (!db) return null;
-    const driver = await db.collection('drivers').findOne({ _id: driverId });
+
+    const normalizedDriverId = driverId instanceof ObjectId
+      ? driverId
+      : safeObjectId(driverId);
+    if (!normalizedDriverId) return null;
+
+    const driver = await db.collection('drivers').findOne({ _id: normalizedDriverId });
     if (!driver) return null;
     if (serviceCode && !driverServiceEnabled(driver, serviceCode)) return null;
+
     const user = await db.collection('users').findOne({ _id: driver.userId });
-    const vehicleQuery = { driverId: driver._id, status: 'APPROVED' };
-    if (serviceCode) vehicleQuery.$or = [{ serviceCodes: String(serviceCode).toUpperCase() }, { serviceCode: String(serviceCode).toUpperCase() }];
-    const vehicle = await db.collection('vehicles').findOne(vehicleQuery);
     if (!user) return null;
+
+    const vehicleQuery = { driverId: driver._id, status: 'APPROVED' };
+    if (serviceCode) {
+      const code = String(serviceCode).toUpperCase();
+      vehicleQuery.$or = [
+        { serviceCodes: code },
+        { approvedServiceCodes: code },
+        { serviceCode: code },
+      ];
+    }
+
+    let vehicle = await db.collection('vehicles').findOne(vehicleQuery);
+
+    // Legacy drivers may have an APPROVED vehicle created before serviceCodes /
+    // approvedServiceCodes were added. The driver profile has already passed
+    // driverServiceEnabled(), so do not discard a nearby eligible driver only
+    // because the old vehicle document does not yet contain the new fields.
+    if (!vehicle && serviceCode) {
+      vehicle = await db.collection('vehicles').findOne({
+        driverId: driver._id,
+        status: 'APPROVED',
+      });
+    }
+
     return { user, driver, vehicle };
   }
 
@@ -581,7 +609,7 @@ function createMatchingEngine({
       if (context.driver.approvalStatus !== 'APPROVED') continue;
       if (context.driver.kycStatus !== 'APPROVED') continue;
       if (context.driver.onlineStatus !== 'ONLINE') continue;
-      if (await hasActiveBooking(driverId)) continue;
+      if (await hasActiveBooking(context.driver._id)) continue;
 
       const coords = location.location?.coordinates || [];
       const lon = Number(coords[0]);
